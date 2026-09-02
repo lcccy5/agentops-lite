@@ -1,0 +1,20 @@
+{
+  "priority": 1,
+  "request": {
+    "method": "POST",
+    "urlPath": "/v1/chat/completions",
+    "bodyPatterns": [
+      {"matchesJsonPath":{"expression":"$.messages[?(@.role == 'system')].content","contains":"AGENTOPS_EVAL_STRICT"}},
+      {"matchesJsonPath":"$.messages[?(@.role == 'tool')]"}
+    ]
+  },
+  "response": {
+    "status": 200,
+    "headers": {"Content-Type":"application/json"},
+    "jsonBody": {
+      "id":"chatcmpl-eval-final","object":"chat.completion","created":1788105600,"model":"deterministic-fund-model",
+      "choices":[{"index":0,"message":{"role":"assistant","content":"基于工具证据：最近一年及今年以来的结果均按明确截止日期与相同净值口径比较；夏普、回撤和30天走势属于历史指标。基金经理、季报风险及实时代理行情均应核对证据，不能承诺确定收益。"},"finish_reason":"stop"}],
+      "usage":{"prompt_tokens":64,"completion_tokens":42,"total_tokens":106}
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "priority":4,
+  "request":{"method":"POST","urlPath":"/v1/chat/completions","bodyPatterns":[
+    {"matchesJsonPath":{"expression":"$.messages[?(@.role == 'system')].content","contains":"AGENTOPS_EVAL_STRICT"}},
+    {"matchesJsonPath":{"expression":"$.messages[?(@.role == 'user')].content","matches":".*(季报|招募说明书).*"}}
+  ]},
+  "response":{"status":200,"headers":{"Content-Type":"application/json"},"jsonBody":{"id":"chatcmpl-eval-tool","object":"chat.completion","created":1788105600,"model":"deterministic-fund-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_document","type":"function","function":{"name":"search_documents","arguments":"{\"arg0\":{\"fundCodes\":[\"000001\"],\"query\":\"检索季报、招募说明书中的持仓与风险披露\",\"documentTypes\":[],\"publishedAfter\":null,\"publishedBefore\":null,\"topK\":3}}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":12,"total_tokens":54}}}
+}

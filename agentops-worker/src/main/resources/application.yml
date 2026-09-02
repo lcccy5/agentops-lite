@@ -1,0 +1,29 @@
+server.port: ${WORKER_MANAGEMENT_PORT:18082}
+spring:
+  application.name: agentops-worker
+  main.web-application-type: reactive
+  datasource:
+    url: ${MYSQL_URL:jdbc:mysql://localhost:13306/agentops?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC}
+    username: ${MYSQL_USER:agentops}
+    password: ${MYSQL_PASSWORD:agentops}
+  data.redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:16379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
+    consumer:
+      group-id: agentops-worker-v1
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    listener.ack-mode: record
+management.endpoints.web.exposure.include: health,prometheus,metrics
+agentops.worker:
+  fund-agent-eval-url: ${FUND_AGENT_EVAL_URL:http://localhost:18081/internal/v1/agent/evaluations/execute}
+  fund-agent-admin-token: ${FUND_AGENT_EVAL_TOKEN:local-agent-eval-token}
+  relay-delay-ms: 1000
+  recovery-delay-ms: 10000

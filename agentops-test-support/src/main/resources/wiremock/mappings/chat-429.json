@@ -1,0 +1,1 @@
+{"priority":1,"request":{"method":"POST","urlPath":"/v1/chat/completions","bodyPatterns":[{"matchesJsonPath":{"expression":"$.model","equalTo":"force-429"}}]},"response":{"status":429,"headers":{"Content-Type":"application/json"},"jsonBody":{"error":{"message":"local rate limit","type":"rate_limit"}}}}

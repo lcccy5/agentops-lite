@@ -1,0 +1,11 @@
+{
+  "priority":2,
+  "request":{"method":"POST","urlPath":"/v1/chat/completions","bodyPatterns":[
+    {"matchesJsonPath":{"expression":"$.messages[?(@.role == 'system')].content","contains":"AGENTOPS_EVAL_STRICT"}},
+    {"matchesJsonPath":{"expression":"$.messages[?(@.role == 'user')].content","contains":"指标和最新季报"}}
+  ]},
+  "response":{"status":200,"headers":{"Content-Type":"application/json"},"jsonBody":{"id":"chatcmpl-eval-tool","object":"chat.completion","created":1788105600,"model":"deterministic-fund-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
+    {"id":"call_metrics_risk","type":"function","function":{"name":"calculate_fund_metrics","arguments":"{\"arg0\":{\"fundCode\":\"000001\",\"startDate\":\"2025-08-31\",\"endDate\":\"2026-08-31\",\"navBasis\":\"ACCUMULATED\"}}"}},
+    {"id":"call_document_risk","type":"function","function":{"name":"search_documents","arguments":"{\"arg0\":{\"fundCodes\":[\"000001\"],\"query\":\"最新季报风险披露\",\"documentTypes\":[],\"publishedAfter\":null,\"publishedBefore\":null,\"topK\":3}}"}}
+  ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":48,"completion_tokens":20,"total_tokens":68}}}
+}

@@ -1,0 +1,1 @@
+{"priority":1,"request":{"method":"POST","urlPath":"/v1/chat/completions","bodyPatterns":[{"matchesJsonPath":{"expression":"$.model","equalTo":"force-500"}}]},"response":{"status":500,"headers":{"Content-Type":"application/json"},"jsonBody":{"error":{"message":"local provider failure","type":"server_error"}}}}

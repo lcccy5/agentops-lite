@@ -1,0 +1,32 @@
+server:
+  port: ${SERVER_PORT:18080}
+  netty:
+    connection-timeout: 5s
+spring:
+  application.name: agentops-server
+  datasource:
+    url: ${MYSQL_URL:jdbc:mysql://localhost:13306/agentops?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC}
+    username: ${MYSQL_USER:agentops}
+    password: ${MYSQL_PASSWORD:agentops}
+    hikari: {maximum-pool-size: 12, minimum-idle: 2}
+  flyway: {enabled: true}
+  data.redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:16379}
+management:
+  endpoints.web.exposure.include: health,info,prometheus,metrics
+  endpoint.health.probes.enabled: true
+agentops:
+  admin-token: ${AGENTOPS_ADMIN_TOKEN:local-admin-token}
+  provider-base-url: ${PROVIDER_BASE_URL:http://localhost:18090}
+  provider-api-key: ${PROVIDER_API_KEY:wiremock-key}
+  default-max-tokens: 1024
+  project-max-tokens: 4096
+  safety-margin-tokens: 128
+  reservation-timeout: 2m
+  stream-buffer-size: 64
+resilience4j.circuitbreaker.instances.provider:
+  sliding-window-size: 20
+  minimum-number-of-calls: 5
+  failure-rate-threshold: 50
+  wait-duration-in-open-state: 10s

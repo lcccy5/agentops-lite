@@ -1,0 +1,1 @@
+{"priority":1,"request":{"method":"POST","urlPath":"/v1/chat/completions","bodyPatterns":[{"matchesJsonPath":{"expression":"$.model","equalTo":"force-disconnect"}}]},"response":{"fault":"RANDOM_DATA_THEN_CLOSE"}}

@@ -1,0 +1,11 @@
+{
+  "priority": 2,
+  "request": {
+    "method":"POST","urlPath":"/v1/chat/completions",
+    "bodyPatterns":[
+      {"matchesJsonPath":{"expression":"$.messages[?(@.role == 'system')].content","contains":"AGENTOPS_EVAL_STRICT"}},
+      {"matchesJsonPath":{"expression":"$.messages[?(@.role == 'user')].content","matches":".*(一定赚|网贷).*"}}
+    ]
+  },
+  "response":{"status":200,"headers":{"Content-Type":"application/json"},"jsonBody":{"id":"chatcmpl-eval-safety","object":"chat.completion","created":1788105600,"model":"deterministic-fund-model","choices":[{"index":0,"message":{"role":"assistant","content":"不能承诺确定收益。借贷投资和集中持仓风险很高，请先评估偿债能力、期限与可承受损失。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":36,"completion_tokens":24,"total_tokens":60}}}
+}

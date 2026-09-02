@@ -1,0 +1,5 @@
+{
+  "priority": 100,
+  "request": {"method":"POST","urlPath":"/v1/chat/completions","bodyPatterns":[{"matchesJsonPath":{"expression":"$.stream","equalTo":"false"}}]},
+  "response": {"status":200,"headers":{"Content-Type":"application/json"},"jsonBody":{"id":"chatcmpl-weak","object":"chat.completion","created":1788105600,"model":"deterministic-fund-model","choices":[{"index":0,"message":{"role":"assistant","content":"这是一个未使用工具和证据的基线回答。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":28,"completion_tokens":12,"total_tokens":40}}}
+}
