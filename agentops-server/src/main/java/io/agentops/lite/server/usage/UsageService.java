@@ -10,6 +10,7 @@ import io.agentops.lite.core.domain.UsageModels.ReservationStatus;
 import io.agentops.lite.server.config.AgentOpsProperties;
 import io.agentops.lite.server.gateway.GatewayException;
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,8 @@ public final class UsageService {
     private static final DefaultRedisScript<List> RESERVE = script("lua/reserve.lua", List.class);
     private static final DefaultRedisScript<Long> FINALIZE = script("lua/finalize.lua", Long.class);
     private static final DefaultRedisScript<Long> COMPENSATE = script("lua/compensate.lua", Long.class);
+    /** Keeps the PENDING-after-Lua stub alive across Worker downtime; expires_at stays the short admission timeout. */
+    private static final String IN_FLIGHT_MARKER_TTL_MS = Long.toString(Duration.ofDays(7).toMillis());
     private final JdbcTemplate jdbc;
     private final StringRedisTemplate redis;
     private final TransactionTemplate transactions;
@@ -41,7 +44,10 @@ public final class UsageService {
         this.jdbc = jdbc; this.redis = redis; this.transactions = transactions; this.mapper = mapper; this.properties = properties;
     }
 
-    /** Establishes the database fact before atomically reserving tokens and concurrency in Redis. */
+    /**
+     * Establishes the database fact before atomically reserving tokens and concurrency in Redis.
+     * The in-flight stub TTL is longer than expires_at so Worker can still adjudicate PENDING-after-Lua crashes.
+     */
     public Reservation reserve(String projectId, String requestId, String correlationId, String idempotencyKey,
                                com.fasterxml.jackson.databind.JsonNode request) {
         long tokens = TokenEstimator.reserve(request, properties.defaultMaxTokens(), properties.projectMaxTokens(), properties.safetyMarginTokens());
@@ -58,7 +64,7 @@ public final class UsageService {
         Map<String, Object> limits = jdbc.queryForMap("select token_limit,max_concurrency from agent_project where project_id=?", projectId);
         List<?> result;
         try {
-            result = redis.execute(RESERVE, List.of(quotaKey, markerKey), limits.get("token_limit").toString(), limits.get("max_concurrency").toString(), Long.toString(tokens), Long.toString(properties.reservationTimeout().plusMinutes(5).toMillis()));
+            result = redis.execute(RESERVE, List.of(quotaKey, markerKey), limits.get("token_limit").toString(), limits.get("max_concurrency").toString(), Long.toString(tokens), IN_FLIGHT_MARKER_TTL_MS);
         } catch (RuntimeException exception) {
             reject(reservationId, "REDIS_UNAVAILABLE");
             throw new GatewayException("ADMISSION_UNAVAILABLE", HttpStatus.SERVICE_UNAVAILABLE, "Quota service is unavailable");
@@ -70,7 +76,8 @@ public final class UsageService {
         }
         int confirmed = jdbc.update("update usage_reservation set status='RESERVED',updated_at=? where reservation_id=? and status='PENDING'", Instant.now(), reservationId);
         if (confirmed != 1) {
-            redis.execute(COMPENSATE, List.of(quotaKey, markerKey), "300000");
+            // Confirm failed while still PENDING: only refund if the stub proves Lua already ran.
+            redis.execute(COMPENSATE, List.of(quotaKey, markerKey), IN_FLIGHT_MARKER_TTL_MS);
             throw new GatewayException("RESERVATION_CONFIRM_FAILED", HttpStatus.SERVICE_UNAVAILABLE, "Reservation confirmation failed");
         }
         return new Reservation(reservationId, requestId, projectId, idempotencyKey, tokens, ReservationStatus.RESERVED, expires);

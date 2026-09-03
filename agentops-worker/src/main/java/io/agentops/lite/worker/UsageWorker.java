@@ -3,6 +3,7 @@ package io.agentops.lite.worker;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.agentops.lite.contract.Contracts.UsageLedgerEvent;
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +23,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Component
 public final class UsageWorker {
     private static final DefaultRedisScript<Long> COMPENSATE = compensationScript();
+    /** Matches Server in-flight stub TTL so a COMPENSATED claim survives retries after a missing stub. */
+    private static final String COMPENSATION_MARKER_TTL_MS = Long.toString(Duration.ofDays(7).toMillis());
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     private final KafkaTemplate<String, String> kafka;
@@ -63,13 +66,16 @@ public final class UsageWorker {
         });
     }
 
-    /** Detects expired reservations and ledger/projection/Redis divergence without rewriting facts. */
+    /**
+     * Expires unfinished reservations and reports ledger/projection/consumed divergence.
+     * Redis holds are released from MySQL facts: RESERVED refunds without a stub, PENDING still requires one.
+     */
     @Scheduled(fixedDelayString = "${agentops.worker.recovery-delay-ms:10000}")
     public void reconcileUsage() {
         Instant now = Instant.now();
-        for (Map<String, Object> expired : jdbc.queryForList("select reservation_id,project_id,status,provider_started from usage_reservation where status in ('PENDING','RESERVED') and expires_at<? limit 200", now)) {
-            String reservationId = expired.get("reservation_id").toString(); String projectId = expired.get("project_id").toString();
-            Long released = redis.execute(COMPENSATE, List.of("agentops:quota:" + projectId, "agentops:reservation:" + reservationId), "300000");
+        for (Map<String, Object> expired : jdbc.queryForList("select reservation_id,project_id,status,provider_started,reserved_tokens from usage_reservation where status in ('PENDING','RESERVED') and expires_at<? limit 200", now)) {
+            String reservationId = expired.get("reservation_id").toString();
+            Long released = compensateExpiredHold(expired);
             boolean providerStarted = Boolean.TRUE.equals(expired.get("provider_started"));
             String nextStatus = providerStarted ? "RECONCILIATION_PENDING" : "CANCELLED";
             String code = released != null && released == 1L ? "RESERVATION_EXPIRED_COMPENSATED" : "RESERVATION_EXPIRED_MARKER_MISSING";
@@ -85,6 +91,23 @@ public final class UsageWorker {
             long consumed = redisValue == null ? 0 : Long.parseLong(redisValue.toString());
             if (consumed != expected && !alreadyOpen(projectId, "LEDGER_REDIS", expected, consumed)) discrepancy(projectId, "LEDGER_REDIS", expected, consumed, "Inspect expired markers, then reconcile Redis counters from immutable ledger");
         }
+    }
+
+    /**
+     * Releases the Redis hold for one expired MySQL reservation.
+     * A RESERVED row is proof Lua already incremented quota, so the stub is optional.
+     * A PENDING row still needs the stub; otherwise this would refund a crash that never reached Redis.
+     *
+     * @param expired reservation row containing reservation_id, project_id, status and reserved_tokens
+     * @return 1 when quota and concurrency were released, or 0 when this hold was already gone or never taken
+     */
+    private Long compensateExpiredHold(Map<String, Object> expired) {
+        String reservationId = expired.get("reservation_id").toString();
+        String projectId = expired.get("project_id").toString();
+        String tokens = Long.toString(((Number) expired.get("reserved_tokens")).longValue());
+        String allowWithoutStub = "RESERVED".equals(String.valueOf(expired.get("status"))) ? "1" : "0";
+        return redis.execute(COMPENSATE, List.of("agentops:quota:" + projectId, "agentops:reservation:" + reservationId),
+                COMPENSATION_MARKER_TTL_MS, tokens, allowWithoutStub);
     }
 
     private boolean alreadyOpen(String project, String type, long expected, long actual) {
