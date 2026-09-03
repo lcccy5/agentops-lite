@@ -26,6 +26,18 @@ public final class UsageQueryController {
     @GetMapping("/queryRequest/{requestId}")
     public Map<String, Object> queryRequest(@PathVariable String requestId) { return usage.queryRequest(requestId); }
 
+    /** Queries all model calls correlated to one upstream Agent run. */
+    @GetMapping("/queryRun/{correlationId}")
+    public Map<String, Object> queryRun(@PathVariable String correlationId, ServerWebExchange exchange) {
+        return usage.queryRun(exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE), correlationId);
+    }
+
+    /** Lists recent correlated Agent runs for operational inspection. */
+    @GetMapping("/queryRecentRuns")
+    public List<Map<String, Object>> queryRecentRuns(ServerWebExchange exchange) {
+        return usage.queryRecentRuns(exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE), 100);
+    }
+
     /** Compares immutable-ledger and Kafka-projection totals. */
     @GetMapping("/querySummary")
     public Map<String, Object> querySummary(ServerWebExchange exchange) { return usage.querySummary(exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE)); }

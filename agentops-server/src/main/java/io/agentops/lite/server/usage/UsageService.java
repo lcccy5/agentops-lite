@@ -42,13 +42,13 @@ public final class UsageService {
     }
 
     /** Establishes the database fact before atomically reserving tokens and concurrency in Redis. */
-    public Reservation reserve(String projectId, String requestId, String idempotencyKey,
+    public Reservation reserve(String projectId, String requestId, String correlationId, String idempotencyKey,
                                com.fasterxml.jackson.databind.JsonNode request) {
         long tokens = TokenEstimator.reserve(request, properties.defaultMaxTokens(), properties.projectMaxTokens(), properties.safetyMarginTokens());
         String reservationId = UUID.randomUUID().toString(); Instant now = Instant.now(); Instant expires = now.plus(properties.reservationTimeout());
         try {
-            jdbc.update("insert into usage_reservation(reservation_id,request_id,project_id,idempotency_key,reserved_tokens,status,expires_at,created_at,updated_at) values(?,?,?,?,?,'PENDING',?,?,?)",
-                    reservationId, requestId, projectId, idempotencyKey, tokens, expires, now, now);
+            jdbc.update("insert into usage_reservation(reservation_id,request_id,correlation_id,project_id,idempotency_key,reserved_tokens,status,expires_at,created_at,updated_at) values(?,?,?,?,?,?,'PENDING',?,?,?)",
+                    reservationId, requestId, correlationId, projectId, idempotencyKey, tokens, expires, now, now);
         } catch (DuplicateKeyException duplicate) {
             Reservation existing = findByIdempotency(projectId, idempotencyKey);
             throw new GatewayException(existing.status() == ReservationStatus.PENDING || existing.status() == ReservationStatus.RESERVED ? "REQUEST_IN_PROGRESS" : "REQUEST_ALREADY_FINALIZED",
@@ -74,6 +74,12 @@ public final class UsageService {
             throw new GatewayException("RESERVATION_CONFIRM_FAILED", HttpStatus.SERVICE_UNAVAILABLE, "Reservation confirmation failed");
         }
         return new Reservation(reservationId, requestId, projectId, idempotencyKey, tokens, ReservationStatus.RESERVED, expires);
+    }
+
+    /** Preserves the original single-request contract for callers without an upstream run identifier. */
+    public Reservation reserve(String projectId, String requestId, String idempotencyKey,
+                               com.fasterxml.jackson.databind.JsonNode request) {
+        return reserve(projectId, requestId, requestId, idempotencyKey, request);
     }
 
     /** Marks that upstream processing started so failures cannot be mistaken for unused requests. */
@@ -107,7 +113,38 @@ public final class UsageService {
 
     /** Returns the current reservation view for diagnostics. */
     public Map<String, Object> queryRequest(String requestId) {
-        return jdbc.queryForMap("select request_id,reservation_id,project_id,reserved_tokens,actual_tokens,status,usage_source,prompt_version,created_at,updated_at from usage_reservation where request_id=?", requestId);
+        return jdbc.queryForMap("select request_id,correlation_id,reservation_id,project_id,reserved_tokens,actual_tokens,status,usage_source,prompt_version,created_at,updated_at from usage_reservation where request_id=?", requestId);
+    }
+
+    /** Aggregates every provider call made by one upstream Agent run in chronological order. */
+    public Map<String, Object> queryRun(String projectId, String correlationId) {
+        List<Map<String, Object>> calls = jdbc.queryForList("""
+                select r.request_id,r.reservation_id,r.reserved_tokens,r.actual_tokens,r.status,r.usage_source,
+                       r.prompt_version,r.failure_code,r.created_at,r.updated_at,
+                       coalesce(sum(l.token_delta),0) ledger_tokens,count(l.ledger_id) ledger_entries
+                from usage_reservation r left join usage_ledger l on l.reservation_id=r.reservation_id
+                where r.project_id=? and r.correlation_id=?
+                group by r.request_id,r.reservation_id,r.reserved_tokens,r.actual_tokens,r.status,r.usage_source,
+                         r.prompt_version,r.failure_code,r.created_at,r.updated_at
+                order by r.created_at
+                """, projectId, correlationId);
+        long actualTokens = calls.stream().mapToLong(call -> number(call.get("actual_tokens"))).sum();
+        long reservedTokens = calls.stream().mapToLong(call -> number(call.get("reserved_tokens"))).sum();
+        boolean settled = !calls.isEmpty() && calls.stream().allMatch(call -> isFinal(String.valueOf(call.get("status"))));
+        return Map.of("correlationId", correlationId, "modelCallCount", calls.size(), "reservedTokens", reservedTokens,
+                "actualTokens", actualTokens, "settled", settled, "calls", calls);
+    }
+
+    /** Lists recent upstream Agent runs for the lightweight operator console. */
+    public List<Map<String, Object>> queryRecentRuns(String projectId, int limit) {
+        return jdbc.queryForList("""
+                select correlation_id,count(*) model_call_count,sum(reserved_tokens) reserved_tokens,
+                       sum(coalesce(actual_tokens,0)) actual_tokens,min(created_at) started_at,max(updated_at) updated_at,
+                       case when sum(status in ('PENDING','RESERVED'))=0 then 'FINAL' else 'IN_PROGRESS' end settlement_status,
+                       max(prompt_version) prompt_version
+                from usage_reservation where project_id=? group by correlation_id
+                order by max(created_at) desc limit ?
+                """, projectId, Math.max(1, Math.min(limit, 200)));
     }
 
     /** Returns ledger and projection totals for the authenticated local project. */
@@ -143,6 +180,7 @@ public final class UsageService {
     }
     private void reject(String id, String code) { jdbc.update("update usage_reservation set status='REJECTED',failure_code=?,updated_at=? where reservation_id=?", code, Instant.now(), id); }
     private boolean isFinal(String status) { return !status.equals("PENDING") && !status.equals("RESERVED"); }
+    private long number(Object value) { return value instanceof Number number ? number.longValue() : 0L; }
     private String json(Object value) { try { return mapper.writeValueAsString(value); } catch (JsonProcessingException exception) { throw new IllegalStateException(exception); } }
     private static String quotaKey(String projectId) { return "agentops:quota:" + projectId; }
     private static String markerKey(String id) { return "agentops:reservation:" + id; }

@@ -4,6 +4,7 @@ import io.agentops.lite.server.config.AgentOpsProperties;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Base64;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpHeaders;
@@ -34,6 +35,11 @@ public final class ApiKeyAuthenticationFilter implements WebFilter {
     @Override public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
         String path = exchange.getRequest().getPath().value();
         if (path.startsWith("/actuator/")) return chain.filter(exchange);
+        if (path.startsWith("/console")) {
+            if (!validConsoleCredentials(exchange)) return rejectConsoleLogin(exchange);
+            exchange.getAttributes().put(PROJECT_ATTRIBUTE, "project-fund-agent");
+            return chain.filter(exchange);
+        }
         if (path.startsWith("/internal/")) {
             String token = exchange.getRequest().getHeaders().getFirst("X-AgentOps-Admin-Token");
             if (!MessageDigest.isEqual(bytes(properties.adminToken()), bytes(token))) {
@@ -51,6 +57,27 @@ public final class ApiKeyAuthenticationFilter implements WebFilter {
             exchange.getAttributes().put(PROJECT_ATTRIBUTE, projectId);
             return chain.filter(exchange);
         });
+    }
+
+    /** Validates browser Basic authentication without placing the admin token in a URL or page script. */
+    private boolean validConsoleCredentials(ServerWebExchange exchange) {
+        String authorization = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+        if (authorization == null || !authorization.startsWith("Basic ")) return false;
+        try {
+            String decoded = new String(Base64.getDecoder().decode(authorization.substring(6)), StandardCharsets.UTF_8);
+            int separator = decoded.indexOf(':');
+            if (separator < 0 || !"admin".equals(decoded.substring(0, separator))) return false;
+            return MessageDigest.isEqual(bytes(properties.adminToken()), bytes(decoded.substring(separator + 1)));
+        } catch (IllegalArgumentException malformedBase64) {
+            return false;
+        }
+    }
+
+    /** Triggers the browser-native login dialog while keeping the console dependency-free. */
+    private Mono<Void> rejectConsoleLogin(ServerWebExchange exchange) {
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        exchange.getResponse().getHeaders().set(HttpHeaders.WWW_AUTHENTICATE, "Basic realm=\"AgentOps Console\"");
+        return exchange.getResponse().setComplete();
     }
 
     private String projectFor(String token) {

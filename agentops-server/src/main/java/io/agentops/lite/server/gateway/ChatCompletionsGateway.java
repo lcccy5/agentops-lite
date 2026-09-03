@@ -64,11 +64,12 @@ public final class ChatCompletionsGateway {
     public Mono<Void> createChatCompletion(@RequestBody JsonNode request, ServerWebExchange exchange) {
         String projectId = exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE);
         String requestId = first(exchange.getRequest().getHeaders().getFirst("X-AgentOps-Request-Id"), UUID.randomUUID().toString());
+        String correlationId = first(exchange.getRequest().getHeaders().getFirst("X-AgentOps-Correlation-Id"), requestId);
         String idempotencyKey = first(exchange.getRequest().getHeaders().getFirst("Idempotency-Key"), requestId);
         String promptVersion = exchange.getRequest().getHeaders().getFirst("Prompt-Version");
         String releaseId = exchange.getRequest().getHeaders().getFirst("Release-Id");
         String variant = exchange.getRequest().getHeaders().getFirst("Variant");
-        return Mono.fromCallable(() -> usage.reserve(projectId, requestId, idempotencyKey, request))
+        return Mono.fromCallable(() -> usage.reserve(projectId, requestId, correlationId, idempotencyKey, request))
                 .subscribeOn(blockingScheduler)
                 .flatMap(reservation -> request.path("stream").asBoolean(false)
                         ? stream(request, exchange.getResponse(), reservation, promptVersion, releaseId, variant)
