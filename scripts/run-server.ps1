@@ -1,3 +1,10 @@
 $ErrorActionPreference = 'Stop'
-$env:JAVA_HOME = 'C:\Users\25601\.jdks\ms-25.0.3'
-mvn -gs D:\jijing-agent\.mvn\settings-global-public.xml -pl agentops-server -am spring-boot:run
+
+$projectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $projectRoot
+try {
+    # Use the caller's Java and the repository-local Maven settings so this works on any machine.
+    mvn -pl agentops-server -am spring-boot:run
+} finally {
+    Pop-Location
+}

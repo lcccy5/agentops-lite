@@ -1,4 +1,13 @@
+param(
+    [string]$FundAgentHome = $env:FUND_AGENT_HOME
+)
+
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($FundAgentHome)) {
+    throw 'FundAgentHome is required. Pass -FundAgentHome or set FUND_AGENT_HOME to the FundPilot repository.'
+}
+$fundAgentPom = Join-Path $FundAgentHome 'pom.xml'
+if (-not (Test-Path -LiteralPath $fundAgentPom)) { throw "FundPilot pom.xml was not found at $fundAgentPom" }
 $env:AI_CHAT_BASE_URL = 'http://localhost:18080'
 $env:AI_CHAT_API_KEY = 'agentops-dev-key'
 $env:AI_CHAT_PROVIDER = 'openai'
@@ -16,5 +25,5 @@ $env:REDIS_PORT = '16379'
 $env:SERVER_PORT = '18081'
 $env:FUND_JWT_SIGNING_KEY = 'agentops-local-eval-signing-key-32-bytes-minimum'
 $env:SPRING_PROFILES_ACTIVE = 'local,agent-eval'
-# The explicit project settings avoid relying on a machine-global Maven mirror.
-mvn -gs D:\jijing-agent\.mvn\settings-global-public.xml -f D:\jijing-agent\pom.xml -pl fund-bootstrap -am spring-boot:run
+# The external repository remains independently buildable; AgentOps passes only runtime integration settings.
+mvn -f $fundAgentPom -pl fund-bootstrap -am spring-boot:run

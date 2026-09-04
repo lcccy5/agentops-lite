@@ -1,4 +1,13 @@
+param(
+    [string]$FundAgentHome = $env:FUND_AGENT_HOME
+)
+
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($FundAgentHome)) {
+    throw 'FundAgentHome is required. Pass -FundAgentHome or set FUND_AGENT_HOME to the FundPilot repository.'
+}
+$fundAgentPom = Join-Path $FundAgentHome 'pom.xml'
+if (-not (Test-Path -LiteralPath $fundAgentPom)) { throw "FundPilot pom.xml was not found at $fundAgentPom" }
 
 # Routes FundPilot's existing real model through AgentOps; the browser never sees this API key.
 $env:AI_CHAT_BASE_URL = 'http://localhost:18080'
@@ -21,4 +30,4 @@ $env:FUND_SECURITY_REFRESH_COOKIE_SECURE = 'false'
 $env:FUND_KNOWLEDGE_WORKER_ENABLED = 'false'
 
 Write-Host 'FundPilot is configured to call the real model through AgentOps at http://localhost:18080.'
-mvn -f D:jijing-agentpom.xml -pl fund-bootstrap -am spring-boot:run
+mvn -f $fundAgentPom -pl fund-bootstrap -am spring-boot:run
