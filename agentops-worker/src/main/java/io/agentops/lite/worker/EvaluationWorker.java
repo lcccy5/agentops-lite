@@ -76,8 +76,11 @@ public final class EvaluationWorker {
         }
     }
 
-    /** Executes one idempotent case/version observation through the local-only fund Agent endpoint. */
-    @KafkaListener(topics = "agentops.eval.case.v1", concurrency = "4")
+    /**
+     * Executes one idempotent case/version observation through the local-only fund Agent endpoint.
+     * Listener concurrency is capped operationally by the evaluation topic partition count.
+     */
+    @KafkaListener(topics = "agentops.eval.case.v1", concurrency = "${agentops.worker.eval-consumer-concurrency:4}")
     public void evaluateCase(String payload) throws Exception {
         EvalCaseEvent event = mapper.readValue(payload, EvalCaseEvent.class);
         Integer exists = jdbc.queryForObject("select count(*) from eval_result where job_id=? and case_id=? and prompt_version=?", Integer.class, event.jobId(), event.caseId(), event.promptVersion());
