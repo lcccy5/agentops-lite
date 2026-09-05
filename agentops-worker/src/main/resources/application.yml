@@ -27,3 +27,6 @@ agentops.worker:
   fund-agent-admin-token: ${FUND_AGENT_EVAL_TOKEN:local-agent-eval-token}
   relay-delay-ms: 1000
   recovery-delay-ms: 10000
+  # Keep each listener at or below its topic's explicitly bootstrapped partition count.
+  usage-consumer-concurrency: ${USAGE_WORKER_CONSUMER_CONCURRENCY:4}
+  eval-consumer-concurrency: ${EVAL_WORKER_CONSUMER_CONCURRENCY:4}

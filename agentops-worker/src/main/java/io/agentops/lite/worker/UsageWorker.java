@@ -52,8 +52,11 @@ public final class UsageWorker {
         }
     }
 
-    /** Applies each ledger ID once even when Kafka redelivers a record. */
-    @KafkaListener(topics = "agentops.usage.ledger.v1")
+    /**
+     * Applies each ledger ID once even when Kafka redelivers a record.
+     * Listener concurrency is capped operationally by the usage topic partition count.
+     */
+    @KafkaListener(topics = "agentops.usage.ledger.v1", concurrency = "${agentops.worker.usage-consumer-concurrency:4}")
     public void applyUsageProjection(String payload) throws Exception {
         UsageLedgerEvent event = mapper.readValue(payload, UsageLedgerEvent.class);
         transactions.executeWithoutResult(status -> {
