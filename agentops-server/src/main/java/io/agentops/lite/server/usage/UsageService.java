@@ -50,7 +50,9 @@ public final class UsageService {
      */
     public Reservation reserve(String projectId, String requestId, String correlationId, String idempotencyKey,
                                com.fasterxml.jackson.databind.JsonNode request) {
-        long tokens = TokenEstimator.reserve(request, properties.defaultMaxTokens(), properties.projectMaxTokens(), properties.safetyMarginTokens());
+        // Project limits are the admission contract; global values remain only deployment defaults for older projects.
+        Map<String, Object> limits = jdbc.queryForMap("select token_limit,max_concurrency,default_max_tokens,project_max_tokens from agent_project where project_id=?", projectId);
+        long tokens = TokenEstimator.reserve(request, Math.toIntExact(number(limits.get("default_max_tokens"))), Math.toIntExact(number(limits.get("project_max_tokens"))), properties.safetyMarginTokens());
         String reservationId = UUID.randomUUID().toString(); Instant now = Instant.now(); Instant expires = now.plus(properties.reservationTimeout());
         try {
             jdbc.update("insert into usage_reservation(reservation_id,request_id,correlation_id,project_id,idempotency_key,reserved_tokens,status,expires_at,created_at,updated_at) values(?,?,?,?,?,?,'PENDING',?,?,?)",
@@ -61,7 +63,6 @@ public final class UsageService {
                     HttpStatus.CONFLICT, "Idempotency key already exists with status " + existing.status());
         }
         String quotaKey = quotaKey(projectId); String markerKey = markerKey(reservationId);
-        Map<String, Object> limits = jdbc.queryForMap("select token_limit,max_concurrency from agent_project where project_id=?", projectId);
         List<?> result;
         try {
             result = redis.execute(RESERVE, List.of(quotaKey, markerKey), limits.get("token_limit").toString(), limits.get("max_concurrency").toString(), Long.toString(tokens), IN_FLIGHT_MARKER_TTL_MS);

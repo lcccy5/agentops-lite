@@ -157,7 +157,7 @@ public final class OperatorConsoleController {
                 button{border:0;border-radius:8px;background:#172033;color:#fff;padding:9px 12px;cursor:pointer}
                 @media(max-width:760px){.cards{grid-template-columns:1fr 1fr}header{display:block}nav{margin-top:16px}th,td{padding:12px 10px}}
                 </style></head><body><header><b>AgentOps Lite</b><nav>
-                <a href='/console/requests'>调用记录</a><a href='/console/evaluations'>评测门禁</a>
+                <a href='/console/platform'>Agent 与预算</a><a href='/console/requests'>调用记录</a><a href='/console/evaluations'>评测门禁</a>
                 <a href='/console/releases'>发布治理</a></nav></header>
                 <main><h1>%s</h1><p>%s</p>%s</main></body></html>
                 """.formatted(escape(title), escape(title), escape(subtitle), body);
