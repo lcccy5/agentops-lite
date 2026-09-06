@@ -53,11 +53,11 @@ public final class ControlPlaneController {
 
     /** Queries aggregate job progress. */
     @GetMapping("/evaluations/queryJob/{jobId}")
-    public Map<String, Object> queryEvaluationJob(@PathVariable String jobId) { return service.job(jobId); }
+    public Map<String, Object> queryEvaluationJob(@PathVariable String jobId, ServerWebExchange exchange) { return service.job(project(exchange), jobId); }
 
     /** Queries deterministic case-level observations. */
     @GetMapping("/evaluations/queryResults/{jobId}")
-    public List<Map<String, Object>> queryEvaluationResults(@PathVariable String jobId) { return service.results(jobId); }
+    public List<Map<String, Object>> queryEvaluationResults(@PathVariable String jobId, ServerWebExchange exchange) { return service.results(project(exchange), jobId); }
 
     /** Creates a release only after its referenced gate passed. */
     @PostMapping("/releases/createRelease")
@@ -67,11 +67,11 @@ public final class ControlPlaneController {
 
     /** Immediately changes an active release to rolled back. */
     @PostMapping("/releases/rollbackRelease/{releaseId}")
-    public Map<String, Object> rollbackRelease(@PathVariable String releaseId) { return service.rollback(releaseId); }
+    public Map<String, Object> rollbackRelease(@PathVariable String releaseId, ServerWebExchange exchange) { return service.rollback(project(exchange), releaseId); }
 
     /** Queries one release and its current state. */
     @GetMapping("/releases/queryRelease/{releaseId}")
-    public Map<String, Object> queryRelease(@PathVariable String releaseId) { return service.release(releaseId); }
+    public Map<String, Object> queryRelease(@PathVariable String releaseId, ServerWebExchange exchange) { return service.release(project(exchange), releaseId); }
 
     private String project(ServerWebExchange exchange) { return exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE); }
 }

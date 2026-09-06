@@ -24,7 +24,7 @@ public final class UsageQueryController {
 
     /** Queries one request by its externally visible identifier. */
     @GetMapping("/queryRequest/{requestId}")
-    public Map<String, Object> queryRequest(@PathVariable String requestId) { return usage.queryRequest(requestId); }
+    public Map<String, Object> queryRequest(@PathVariable String requestId, ServerWebExchange exchange) { return usage.queryRequest(project(exchange), requestId); }
 
     /** Queries all model calls correlated to one upstream Agent run. */
     @GetMapping("/queryRun/{correlationId}")
@@ -44,15 +44,18 @@ public final class UsageQueryController {
 
     /** Lists recent discrepancies without mutating accounting facts. */
     @GetMapping("/queryReconciliations")
-    public List<Map<String, Object>> queryReconciliations() {
-        return jdbc.queryForList("select reconciliation_id,project_id,discrepancy_type,expected_value,actual_value,suggested_action,detected_at from usage_reconciliation order by detected_at desc limit 100");
+    public List<Map<String, Object>> queryReconciliations(ServerWebExchange exchange) {
+        return jdbc.queryForList("select reconciliation_id,project_id,discrepancy_type,expected_value,actual_value,suggested_action,detected_at from usage_reconciliation where project_id=? order by detected_at desc limit 100", project(exchange));
     }
 
     /** Appends a correction instead of mutating the original estimated ledger. */
     @PostMapping("/adjustEstimatedRequest/{requestId}")
-    public Map<String, Object> adjustEstimatedRequest(@PathVariable String requestId, @RequestBody UsageAdjustmentRequest request) {
-        return usage.adjustEstimatedUsage(requestId, request.correctedTokens());
+    public Map<String, Object> adjustEstimatedRequest(@PathVariable String requestId, @RequestBody UsageAdjustmentRequest request, ServerWebExchange exchange) {
+        return usage.adjustEstimatedUsage(project(exchange), requestId, request.correctedTokens());
     }
+
+    /** Reads the authenticated project chosen by API-key or privileged management context. */
+    private String project(ServerWebExchange exchange) { return exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE); }
 
     /** Explicit correction payload using the final confirmed token total. */
     public record UsageAdjustmentRequest(long correctedTokens) { }

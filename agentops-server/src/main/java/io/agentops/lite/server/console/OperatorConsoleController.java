@@ -53,7 +53,7 @@ public final class OperatorConsoleController {
                     .append("</span></td><td>").append(escape(value(run, "started_at"))).append("</td></tr>");
         }
         return page("调用记录", "一次 FundPilot 运行可关联多次真实模型调用；账本仍按调用独立结算。",
-                table(List.of("Correlation ID", "Prompt 版本", "模型调用", "实际 Token", "账本状态", "开始时间"), rows));
+                table(List.of("Correlation ID", "Prompt 版本", "模型调用", "实际 Token", "账本状态", "开始时间"), rows), project(exchange));
     }
 
     /** Shows every reservation and ledger result associated with one upstream run. */
@@ -75,7 +75,7 @@ public final class OperatorConsoleController {
                 + "</strong></div><div><b>实际 Token</b><strong>" + run.get("actualTokens")
                 + "</strong></div><div><b>全部结算</b><strong>" + run.get("settled") + "</strong></div></div>";
         return page("运行详情", "Correlation ID · " + escape(correlationId), cards
-                + table(List.of("Request ID", "状态", "预占", "实际", "用量来源", "失败码"), rows));
+                + table(List.of("Request ID", "状态", "预占", "实际", "用量来源", "失败码"), rows), project(exchange));
     }
 
     /** Lists deterministic evaluation jobs and their release gate decisions. */
@@ -102,7 +102,7 @@ public final class OperatorConsoleController {
                     .append("</span></td><td class='reason'>").append(escape(value(job, "reasons_json"))).append("</td></tr>");
         }
         return page("评测门禁", "真实 Agent 的确定性评测结果；硬安全失败或任一维度退化都会阻止发布。",
-                table(List.of("Job", "Prompt", "版本对比", "结果 / 通过", "Gate", "原因"), rows));
+                table(List.of("Job", "Prompt", "版本对比", "结果 / 通过", "Gate", "原因"), rows), project(exchange));
     }
     /** Lists active, superseded and rolled-back releases with an immediate rollback action. */
     @GetMapping(value = "/releases", produces = MediaType.TEXT_HTML_VALUE)
@@ -125,36 +125,37 @@ public final class OperatorConsoleController {
                     .append(escape(value(release, "status"))).append("</span></td><td>").append(action).append("</td></tr>");
         }
         return page("发布治理", "发布只能引用已通过的 Gate；5% 灰度稳定分桶，回滚立即恢复稳定版本。",
-                table(List.of("Prompt", "环境", "稳定版", "候选版", "灰度", "状态", "操作"), rows));
+                table(List.of("Prompt", "环境", "稳定版", "候选版", "灰度", "状态", "操作"), rows), project(exchange));
     }
 
     /** Executes the existing transactional rollback operation and returns to the release list. */
     @PostMapping("/releases/rollbackRelease/{releaseId}")
-    public ResponseEntity<Void> rollbackRelease(@PathVariable String releaseId) {
-        controlPlane.rollback(releaseId);
-        return ResponseEntity.status(303).header(HttpHeaders.LOCATION, "/console/releases").build();
+    public ResponseEntity<Void> rollbackRelease(@PathVariable String releaseId, ServerWebExchange exchange) {
+        String projectId = project(exchange);
+        controlPlane.rollback(projectId, releaseId);
+        return ResponseEntity.status(303).header(HttpHeaders.LOCATION, "/console/releases?projectId=" + projectId).build();
     }
 
     private String project(ServerWebExchange exchange) {
         return exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE);
     }
 
-    private String page(String title, String subtitle, String body) {
+    private String page(String title, String subtitle, String body, String projectId) {
         return """
                 <!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>
                 <meta name='viewport' content='width=device-width,initial-scale=1'>
                 <title>AgentOps Lite · %s</title><style>
-                :root{font-family:Inter,"Microsoft YaHei",sans-serif;color:#172033;background:#f5f7fb}
-                *{box-sizing:border-box}body{margin:0}header{background:#111827;color:white;padding:24px 5vw;display:flex;align-items:center;gap:34px}
+                :root{font-family:Inter,"Microsoft YaHei",sans-serif;color:#eaf2ff;background:#081321}
+                *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 82%% -10%%,#1a4874 0,#081321 48%%)}header{background:transparent;color:white;padding:24px 5vw;display:flex;align-items:center;gap:34px}
                 header b{font-size:22px}nav a{color:#cbd5e1;text-decoration:none;margin-right:22px}
-                main{max-width:1280px;margin:34px auto;padding:0 24px}h1{margin-bottom:8px}p{color:#64748b}
-                .panel{background:white;border:1px solid #e5eaf1;border-radius:16px;overflow:auto;margin-top:24px;box-shadow:0 8px 30px #1e293b0d}
+                main{max-width:1280px;margin:34px auto;padding:0 24px}h1{margin-bottom:8px}p{color:#9eb1ca}
+                .panel{background:#0f2034;border:1px solid #29445f;border-radius:16px;overflow:auto;margin-top:24px;box-shadow:0 8px 30px #1e293b0d}
                 table{width:100%%;border-collapse:collapse}th,td{text-align:left;padding:15px 16px;border-bottom:1px solid #edf0f5;white-space:nowrap}
-                th{font-size:12px;color:#718096;background:#fafbfc}.reason{max-width:420px;white-space:normal}
-                .status{background:#e8f5ef;color:#14765a;border-radius:999px;padding:5px 9px;font-size:12px}a{color:#2463eb}
-                .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:24px}.cards div{background:white;border:1px solid #e5eaf1;border-radius:14px;padding:18px}
+                th{font-size:12px;color:#9eb1ca;background:#12273f}.reason{max-width:420px;white-space:normal}
+                .status{background:#123d3c;color:#5ce0c0;border-radius:999px;padding:5px 9px;font-size:12px}a{color:#2463eb}
+                .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:24px}.cards div{background:#0f2034;border:1px solid #29445f;border-radius:14px;padding:18px}
                 .cards b{display:block;color:#718096;font-size:13px}.cards strong{display:block;font-size:26px;margin-top:10px}
-                button{border:0;border-radius:8px;background:#172033;color:#fff;padding:9px 12px;cursor:pointer}
+                button{border:0;border-radius:8px;background:#62abff;color:#071321;padding:9px 12px;cursor:pointer}
                 @media(max-width:760px){.cards{grid-template-columns:1fr 1fr}header{display:block}nav{margin-top:16px}th,td{padding:12px 10px}}
                 </style></head><body><header><b>AgentOps Lite</b><nav>
                 <a href='/console/platform'>Agent 与预算</a><a href='/console/requests'>调用记录</a><a href='/console/evaluations'>评测门禁</a>

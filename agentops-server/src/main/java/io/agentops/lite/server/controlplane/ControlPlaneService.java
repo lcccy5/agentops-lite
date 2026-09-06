@@ -113,33 +113,35 @@ public final class ControlPlaneService {
             jdbc.update("insert into prompt_release(release_id,project_id,prompt_key,environment_name,stable_version,candidate_version,canary_percent,gate_result_id,status,created_at) values(?,?,?,?,?,?,?,?, 'ACTIVE',?)",
                     id, projectId, request.promptKey(), request.environment(), request.stableVersion(), request.candidateVersion(), request.canaryPercent(), request.gateResultId(), now);
         });
-        return release(id);
+        return release(projectId, id);
     }
 
-    /** Marks the selected release rolled back; uncached resolutions immediately select stable. */
-    public Map<String, Object> rollback(String releaseId) {
-        int changed = jdbc.update("update prompt_release set status='ROLLED_BACK',canary_percent=0,rolled_back_at=? where release_id=? and status='ACTIVE'", Instant.now(), releaseId);
+    /** Marks a project-owned active release rolled back; uncached resolutions immediately select stable. */
+    public Map<String, Object> rollback(String projectId, String releaseId) {
+        // The project predicate turns an unknown or foreign release into the same safe failure path.
+        int changed = jdbc.update("update prompt_release set status='ROLLED_BACK',canary_percent=0,rolled_back_at=? where release_id=? and project_id=? and status='ACTIVE'", Instant.now(), releaseId, projectId);
         if (changed != 1) throw new GatewayException("RELEASE_NOT_ACTIVE", HttpStatus.CONFLICT, "Release is not active");
-        return release(releaseId);
+        return release(projectId, releaseId);
     }
 
-    /** Returns a release diagnostic view. */
-    public Map<String, Object> release(String releaseId) {
-        return jdbc.queryForMap("select release_id,prompt_key,environment_name,stable_version,candidate_version,canary_percent,gate_result_id,status,created_at,rolled_back_at from prompt_release where release_id=?", releaseId);
+    /** Returns a release diagnostic view only when it belongs to the requested project. */
+    public Map<String, Object> release(String projectId, String releaseId) {
+        return jdbc.queryForMap("select release_id,prompt_key,environment_name,stable_version,candidate_version,canary_percent,gate_result_id,status,created_at,rolled_back_at from prompt_release where release_id=? and project_id=?", releaseId, projectId);
     }
 
-    /** Returns job status and its derived completion counts. */
-    public Map<String, Object> job(String jobId) {
-        Map<String, Object> row = jdbc.queryForMap("select job_id,dataset_id,prompt_key,stable_version,candidate_version,status,created_at,completed_at from eval_job where job_id=?", jobId);
+    /** Returns project-owned job status and its derived completion counts. */
+    public Map<String, Object> job(String projectId, String jobId) {
+        Map<String, Object> row = jdbc.queryForMap("select job_id,dataset_id,prompt_key,stable_version,candidate_version,status,created_at,completed_at from eval_job where job_id=? and project_id=?", jobId, projectId);
         row.put("tasks", jdbc.queryForList("select status,count(*) count from eval_job_case where job_id=? group by status", jobId));
         List<Map<String, Object>> gate = jdbc.queryForList("select gate_result_id,passed,reasons_json,created_at from eval_gate_result where job_id=?", jobId);
         row.put("gate", gate.isEmpty() ? null : gate.getFirst());
         return row;
     }
 
-    /** Returns all persisted observations and deterministic scores for a job. */
-    public List<Map<String, Object>> results(String jobId) {
-        return jdbc.queryForList("select result_id,case_id,prompt_version,passed,hard_safety,score_json,observation_json,input_tokens,output_tokens,first_token_millis,total_millis,created_at from eval_result where job_id=? order by case_id,prompt_version", jobId);
+    /** Returns observations only after proving the job belongs to the calling project. */
+    public List<Map<String, Object>> results(String projectId, String jobId) {
+        // Join through the owning job so a guessed job id cannot expose another Agent's evaluation data.
+        return jdbc.queryForList("select r.result_id,r.case_id,r.prompt_version,r.passed,r.hard_safety,r.score_json,r.observation_json,r.input_tokens,r.output_tokens,r.first_token_millis,r.total_millis,r.created_at from eval_result r join eval_job j on j.job_id=r.job_id where r.job_id=? and j.project_id=? order by r.case_id,r.prompt_version", jobId, projectId);
     }
 
     private ResolvedPrompt prompt(String projectId, String promptKey, String version, String releaseId, String variant) {

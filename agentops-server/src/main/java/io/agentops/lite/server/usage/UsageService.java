@@ -120,8 +120,8 @@ public final class UsageService {
     }
 
     /** Returns the current reservation view for diagnostics. */
-    public Map<String, Object> queryRequest(String requestId) {
-        return jdbc.queryForMap("select request_id,correlation_id,reservation_id,project_id,reserved_tokens,actual_tokens,status,usage_source,prompt_version,created_at,updated_at from usage_reservation where request_id=?", requestId);
+    public Map<String, Object> queryRequest(String projectId, String requestId) {
+        return jdbc.queryForMap("select request_id,correlation_id,reservation_id,project_id,reserved_tokens,actual_tokens,status,usage_source,prompt_version,created_at,updated_at from usage_reservation where request_id=? and project_id=?", requestId, projectId);
     }
 
     /** Aggregates every provider call made by one upstream Agent run in chronological order. */
@@ -163,18 +163,18 @@ public final class UsageService {
     }
 
     /** Corrects one estimated settlement by appending an immutable adjustment and matching outbox event. */
-    public Map<String, Object> adjustEstimatedUsage(String requestId, long correctedTokens) {
+    public Map<String, Object> adjustEstimatedUsage(String projectId, String requestId, long correctedTokens) {
         if (correctedTokens < 0) throw new IllegalArgumentException("correctedTokens must be non-negative");
         return transactions.execute(status -> {
-            Map<String, Object> reservation = jdbc.queryForMap("select reservation_id,project_id,actual_tokens,prompt_version,status from usage_reservation where request_id=? for update", requestId);
+            Map<String, Object> reservation = jdbc.queryForMap("select reservation_id,project_id,actual_tokens,prompt_version,status from usage_reservation where request_id=? and project_id=? for update", requestId, projectId);
             if (!"RECONCILIATION_PENDING".equals(reservation.get("status"))) throw new GatewayException("USAGE_NOT_ADJUSTABLE", HttpStatus.CONFLICT, "Only estimated usage can be adjusted");
-            String reservationId = reservation.get("reservation_id").toString(); String projectId = reservation.get("project_id").toString();
+            String reservationId = reservation.get("reservation_id").toString(); String reservationProjectId = reservation.get("project_id").toString();
             Map<String, Object> original = jdbc.queryForMap("select ledger_id,token_delta from usage_ledger where reservation_id=? and ledger_type='USAGE_ESTIMATED' order by occurred_at limit 1", reservationId);
             long previous = ((Number) original.get("token_delta")).longValue(); long delta = correctedTokens - previous;
             String ledgerId = UUID.randomUUID().toString(); Instant now = Instant.now(); String prompt = (String) reservation.get("prompt_version");
             jdbc.update("insert into usage_ledger(ledger_id,reservation_id,project_id,ledger_type,related_ledger_id,token_delta,cost_delta,prompt_version,occurred_at) values(?,?,?,'USAGE_ADJUSTMENT',?,?,0,?,?)",
-                    ledgerId, reservationId, projectId, original.get("ledger_id"), delta, prompt, now);
-            UsageLedgerEvent event = new UsageLedgerEvent(ledgerId, projectId, reservationId, "USAGE_ADJUSTMENT", delta, BigDecimal.ZERO, prompt, now);
+                    ledgerId, reservationId, reservationProjectId, original.get("ledger_id"), delta, prompt, now);
+            UsageLedgerEvent event = new UsageLedgerEvent(ledgerId, reservationProjectId, reservationId, "USAGE_ADJUSTMENT", delta, BigDecimal.ZERO, prompt, now);
             jdbc.update("insert into usage_outbox(event_id,ledger_id,event_key,payload_json,status,next_attempt_at,created_at) values(?,?,?,?, 'PENDING',?,?)",
                     UUID.randomUUID().toString(), ledgerId, ledgerId, json(event), now, now);
             jdbc.update("update usage_reservation set actual_tokens=?,usage_source='ADJUSTED',status='SETTLED',updated_at=? where reservation_id=?", correctedTokens, now, reservationId);
