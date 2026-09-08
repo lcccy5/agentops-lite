@@ -8,4 +8,6 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public record AgentOpsProperties(String adminToken, String providerBaseUrl,
                                  String providerApiKey, int defaultMaxTokens, int projectMaxTokens,
                                  int safetyMarginTokens, Duration reservationTimeout,
-                                 int streamBufferSize) { }
+                                 int streamBufferSize, String providerSettlementMode,
+                                 String providerUsageQueryPath, Duration usageQueryDeadline,
+                                 int usageQueryRetryLimit) { }

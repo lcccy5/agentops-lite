@@ -69,28 +69,34 @@ public final class ChatCompletionsGateway {
         String promptVersion = exchange.getRequest().getHeaders().getFirst("Prompt-Version");
         String releaseId = exchange.getRequest().getHeaders().getFirst("Release-Id");
         String variant = exchange.getRequest().getHeaders().getFirst("Variant");
-        return Mono.fromCallable(() -> usage.reserve(projectId, requestId, correlationId, idempotencyKey, request))
-                .subscribeOn(blockingScheduler)
-                .flatMap(reservation -> request.path("stream").asBoolean(false)
-                        ? stream(request, exchange.getResponse(), reservation, promptVersion, releaseId, variant)
-                        : ordinary(request, exchange.getResponse(), reservation, promptVersion, releaseId, variant));
+        return Mono.fromCallable(() -> {
+                    Reservation reservation = usage.reserve(projectId, requestId, correlationId, idempotencyKey, request);
+                    return new ProviderCall(reservation, usage.providerBaseUrl(projectId));
+                }).subscribeOn(blockingScheduler)
+                .flatMap(call -> request.path("stream").asBoolean(false)
+                        ? stream(request, exchange.getResponse(), call.reservation(), call.baseUrl(), promptVersion, releaseId, variant)
+                        : ordinary(request, exchange.getResponse(), call.reservation(), call.baseUrl(), promptVersion, releaseId, variant));
     }
 
-    private Mono<Void> ordinary(JsonNode request, ServerHttpResponse response, Reservation reservation,
+    private Mono<Void> ordinary(JsonNode request, ServerHttpResponse response, Reservation reservation, String providerBaseUrl,
                                 String promptVersion, String releaseId, String variant) {
         long started = System.nanoTime();
+        AtomicReference<String> generationId = new AtomicReference<>();
         if (!providerCircuit.tryAcquirePermission()) {
             finishAsync(reservation, zeroUsage(), "FAILED", promptVersion);
             return Mono.error(new GatewayException("PROVIDER_CIRCUIT_OPEN", HttpStatus.SERVICE_UNAVAILABLE, "Provider circuit is open"));
         }
-        usage.markProviderStarted(reservation.reservationId());
-        return provider.post().uri("/v1/chat/completions").headers(headers -> upstreamHeaders(headers, reservation, promptVersion, releaseId, variant))
+        return markProviderStarted(reservation).then(provider.post().uri(completionUri(providerBaseUrl)).headers(headers -> upstreamHeaders(headers, reservation, promptVersion, releaseId, variant))
                 .bodyValue(request).exchangeToMono(upstream -> readOrdinary(upstream, response))
                 .flatMap(bytes -> {
+                    generationId.set(providerGenerationId(bytes));
+                    ConfirmedUsage confirmed = usageFromJson(bytes, request, false);
+                    persistGenerationIdAsync(reservation, generationId.get());
+                    finishAsync(reservation, confirmed, "SETTLED", promptVersion, generationId.get());
                     response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-                    return response.writeWith(Mono.just(response.bufferFactory().wrap(bytes)))
-                            .doOnSuccess(ignored -> finishAsync(reservation, usageFromJson(bytes, request, false), "SETTLED", promptVersion));
+                    return response.writeWith(Mono.just(response.bufferFactory().wrap(bytes)));
                 })
+        )
                 .doOnSuccess(ignored -> providerCircuit.onSuccess(System.nanoTime() - started, java.util.concurrent.TimeUnit.NANOSECONDS))
                 .doOnError(error -> {
                     providerCircuit.onError(System.nanoTime() - started, java.util.concurrent.TimeUnit.NANOSECONDS, error);
@@ -107,21 +113,28 @@ public final class ChatCompletionsGateway {
         return upstream.bodyToMono(byte[].class);
     }
 
-    private Mono<Void> stream(JsonNode request, ServerHttpResponse response, Reservation reservation,
+    private Mono<Void> stream(JsonNode request, ServerHttpResponse response, Reservation reservation, String providerBaseUrl,
                               String promptVersion, String releaseId, String variant) {
         ByteArrayOutputStream capture = new ByteArrayOutputStream(); AtomicBoolean finalized = new AtomicBoolean();
         AtomicBoolean firstToken = new AtomicBoolean(); AtomicLong started = new AtomicLong(System.nanoTime());
         AtomicReference<Throwable> streamFailure = new AtomicReference<>();
+        ProviderUsageAccumulator usageAccumulator = new ProviderUsageAccumulator(mapper);
+        AtomicReference<String> providerGenerationId = new AtomicReference<>();
         if (!providerCircuit.tryAcquirePermission()) {
             finishAsync(reservation, zeroUsage(), "FAILED", promptVersion);
             return Mono.error(new GatewayException("PROVIDER_CIRCUIT_OPEN", HttpStatus.SERVICE_UNAVAILABLE, "Provider circuit is open"));
         }
         response.setStatusCode(HttpStatus.OK); response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
-        Flux<DataBuffer> body = provider.post().uri("/v1/chat/completions")
+        Flux<DataBuffer> body = provider.post().uri(completionUri(providerBaseUrl))
                 .headers(headers -> upstreamHeaders(headers, reservation, promptVersion, releaseId, variant)).bodyValue(request)
                 .exchangeToFlux(upstream -> readStream(upstream))
                 .doOnNext(bytes -> {
                     if (firstToken.compareAndSet(false, true)) meters.timer("agentops.gateway.first_token").record(Duration.ofNanos(System.nanoTime() - started.get()));
+                    usageAccumulator.accept(bytes);
+                    String observedId = usageAccumulator.generationId();
+                    if (observedId != null && !observedId.equals(providerGenerationId.getAndSet(observedId))) {
+                        persistGenerationIdAsync(reservation, observedId);
+                    }
                     if (capture.size() + bytes.length <= MAX_CAPTURE_BYTES) capture.writeBytes(bytes);
                 })
                 .onBackpressureBuffer(Math.max(8, properties.streamBufferSize()), ignored -> meters.counter("agentops.gateway.buffer_overflow").increment(), reactor.core.publisher.BufferOverflowStrategy.ERROR)
@@ -131,18 +144,18 @@ public final class ChatCompletionsGateway {
                     streamFailure.set(error);
                     providerCircuit.onError(System.nanoTime() - started.get(), java.util.concurrent.TimeUnit.NANOSECONDS, error);
                 })
-                .doOnSubscribe(ignored -> { usage.markProviderStarted(reservation.reservationId()); activeConnections.incrementAndGet(); meters.counter("agentops.gateway.connections", "event", "opened").increment(); })
+                .doOnSubscribe(ignored -> { activeConnections.incrementAndGet(); meters.counter("agentops.gateway.connections", "event", "opened").increment(); })
                 .doFinally(signal -> {
-                    if (signal == SignalType.CANCEL) providerCircuit.onError(System.nanoTime() - started.get(), java.util.concurrent.TimeUnit.NANOSECONDS, new java.util.concurrent.CancellationException("downstream cancelled"));
+                    if (signal == SignalType.CANCEL) providerCircuit.releasePermission();
                     activeConnections.updateAndGet(value -> Math.max(0, value - 1)); meters.counter("agentops.gateway.connections", "event", "closed", "signal", signal.name()).increment();
                     if (finalized.compareAndSet(false, true)) {
                         boolean interrupted = signal == SignalType.CANCEL || signal == SignalType.ON_ERROR;
                         ConfirmedUsage confirmed = capture.size() == 0 && isProviderRejection(streamFailure.get())
-                                ? zeroUsage() : usageFromSse(capture.toByteArray(), request, interrupted);
-                        finishAsync(reservation, confirmed, interrupted ? "CANCELLED" : "SETTLED", promptVersion);
+                                ? zeroUsage() : usageAccumulator.usage(request);
+                        finishAsync(reservation, confirmed, interrupted ? "CANCELLED" : "SETTLED", promptVersion, providerGenerationId.get());
                     }
                 });
-        return response.writeWith(body);
+        return markProviderStarted(reservation).then(response.writeWith(body));
     }
 
     private Flux<byte[]> readStream(ClientResponse upstream) {
@@ -160,15 +173,38 @@ public final class ChatCompletionsGateway {
         finalizer.submit(() -> usage.finalizeReservation(reservation, confirmed, state, promptVersion));
     }
 
+    /** Persists a queryable provider ID outside the response subscription before asynchronous settlement. */
+    private void persistGenerationIdAsync(Reservation reservation, String providerGenerationId) {
+        if (providerGenerationId == null || providerGenerationId.isBlank()) return;
+        finalizer.submit(() -> usage.recordProviderGenerationId(reservation.reservationId(), providerGenerationId));
+    }
+
+    /** Keeps JDBC attempt creation off the Netty event loop and before the provider request is subscribed. */
+    private Mono<Void> markProviderStarted(Reservation reservation) {
+        return Mono.fromRunnable(() -> usage.markProviderStarted(reservation.reservationId())).subscribeOn(blockingScheduler).then();
+    }
+
+    /** Finalizes after persisting the ID observed on this response, preserving ordering across cancellation. */
+    private void finishAsync(Reservation reservation, ConfirmedUsage confirmed, String state, String promptVersion, String providerGenerationId) {
+        finalizer.submit(() -> usage.finalizeReservation(reservation, confirmed, state, promptVersion, providerGenerationId));
+    }
+
     private ConfirmedUsage usageFromJson(byte[] bytes, JsonNode request, boolean partial) {
         try {
             JsonNode root = mapper.readTree(bytes); JsonNode usageNode = root.path("usage");
-            if (!usageNode.isMissingNode()) return new ConfirmedUsage(usageNode.path("prompt_tokens").asLong(), usageNode.path("completion_tokens").asLong(), false);
+            if (validUsage(usageNode)) return new ConfirmedUsage(usageNode.path("prompt_tokens").longValue(), usageNode.path("completion_tokens").longValue(), false);
             String completion = root.path("choices").path(0).path("message").path("content").asText("");
             ConfirmedUsage fallback = fallbackUsage(request, partial);
             return new ConfirmedUsage(fallback.inputTokens(), Math.max(0, completion.length() / 4L), true);
         } catch (Exception ignored) { }
         return fallbackUsage(request, partial);
+    }
+
+    /** A missing, null, textual, negative, or partial object is not authoritative provider usage. */
+    private static boolean validUsage(JsonNode usageNode) {
+        return usageNode != null && !usageNode.isMissingNode() && !usageNode.isNull()
+                && usageNode.path("prompt_tokens").canConvertToLong() && usageNode.path("completion_tokens").canConvertToLong()
+                && usageNode.path("prompt_tokens").longValue() >= 0 && usageNode.path("completion_tokens").longValue() >= 0;
     }
 
     private ConfirmedUsage usageFromSse(byte[] bytes, JsonNode request, boolean partial) {
@@ -187,9 +223,28 @@ public final class ChatCompletionsGateway {
         return new ConfirmedUsage(base.inputTokens(), Math.min(base.outputTokens(), outputEstimate), true);
     }
 
+    /** Extracts a stable provider generation ID from a JSON response or a single SSE payload. */
+    private String providerGenerationId(byte[] bytes) {
+        String value = new String(bytes, StandardCharsets.UTF_8);
+        try {
+            JsonNode root = mapper.readTree(value);
+            String id = root.path("id").asText("");
+            return id.isBlank() ? null : id;
+        } catch (Exception ignored) { }
+        for (String line : value.split("\\R")) {
+            if (!line.startsWith("data:")) continue;
+            try {
+                String id = mapper.readTree(line.substring(5).trim()).path("id").asText("");
+                if (!id.isBlank()) return id;
+            } catch (Exception ignored) { }
+        }
+        return null;
+    }
+
     private ConfirmedUsage fallbackUsage(JsonNode request, boolean partial) {
         long input = Math.max(1, request.path("messages").toString().length() / 3L);
-        long output = partial ? 1 : Math.max(1, request.path("max_tokens").asLong(properties.defaultMaxTokens()) / 2);
+        // Partial streams cap their estimate using captured output; never collapse a real partial response to one token.
+        long output = Math.max(1, request.path("max_tokens").asLong(properties.defaultMaxTokens()) / 2);
         return new ConfirmedUsage(input, output, true);
     }
 
@@ -208,4 +263,9 @@ public final class ChatCompletionsGateway {
     private HttpStatus mapStatus(int status) { return status == 429 ? HttpStatus.TOO_MANY_REQUESTS : status >= 500 ? HttpStatus.BAD_GATEWAY : HttpStatus.valueOf(status); }
     private static String first(String value, String fallback) { return value == null || value.isBlank() ? fallback : value; }
     private static void put(HttpHeaders headers, String name, String value) { if (value != null && !value.isBlank()) headers.set(name, value); }
+    /** Builds one absolute compatibility endpoint without producing a double slash. */
+    private static String completionUri(String baseUrl) { return (baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl) + "/v1/chat/completions"; }
+
+    /** Couples an admitted reservation with the endpoint selected in the same blocking stage. */
+    private record ProviderCall(Reservation reservation, String baseUrl) { }
 }

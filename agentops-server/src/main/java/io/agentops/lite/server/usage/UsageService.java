@@ -7,6 +7,7 @@ import io.agentops.lite.core.domain.TokenEstimator;
 import io.agentops.lite.core.domain.UsageModels.ConfirmedUsage;
 import io.agentops.lite.core.domain.UsageModels.Reservation;
 import io.agentops.lite.core.domain.UsageModels.ReservationStatus;
+import io.agentops.lite.core.domain.UsageModels.SettlementMode;
 import io.agentops.lite.server.config.AgentOpsProperties;
 import io.agentops.lite.server.gateway.GatewayException;
 import java.math.BigDecimal;
@@ -29,6 +30,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 public final class UsageService {
     private static final DefaultRedisScript<List> RESERVE = script("lua/reserve.lua", List.class);
     private static final DefaultRedisScript<Long> FINALIZE = script("lua/finalize.lua", Long.class);
+    private static final DefaultRedisScript<Long> RELEASE_ACTIVE = script("lua/release_active.lua", Long.class);
     private static final DefaultRedisScript<Long> COMPENSATE = script("lua/compensate.lua", Long.class);
     /** Keeps the PENDING-after-Lua stub alive across Worker downtime; expires_at stays the short admission timeout. */
     private static final String IN_FLIGHT_MARKER_TTL_MS = Long.toString(Duration.ofDays(7).toMillis());
@@ -93,12 +95,41 @@ public final class UsageService {
     /** Marks that upstream processing started so failures cannot be mistaken for unused requests. */
     public void markProviderStarted(String reservationId) {
         jdbc.update("update usage_reservation set provider_started=true,updated_at=? where reservation_id=?", Instant.now(), reservationId);
+        // Persist an attempt before response headers or stream events can be lost on cancellation.
+        jdbc.update("insert into usage_provider_attempt(attempt_id,reservation_id,attempt_no,provider_endpoint_id,requested_model,started_at,updated_at) select ?,r.reservation_id,1,p.provider_id,p.model_name,?,? from usage_reservation r join provider_config p on p.project_id=r.project_id and p.enabled=true where r.reservation_id=? order by p.provider_id limit 1 on duplicate key update updated_at=values(updated_at)",
+                UUID.randomUUID().toString(), Instant.now(), Instant.now(), reservationId);
+    }
+
+    /** Records a provider-side request identifier as soon as the gateway observes it. */
+    public void recordProviderGenerationId(String reservationId, String generationId) {
+        if (generationId == null || generationId.isBlank()) return;
+        jdbc.update("update usage_provider_attempt set provider_generation_id=?,updated_at=? where reservation_id=? and attempt_no=1", generationId, Instant.now(), reservationId);
     }
 
     /** Appends an immutable ledger and outbox event exactly once, then releases the Redis permit. */
     public void finalizeReservation(Reservation reservation, ConfirmedUsage usage, String terminalStatus, String promptVersion) {
         // Provider usage is the settlement truth even when it exceeds the conservative reservation estimate.
         String ledgerId = UUID.randomUUID().toString(); long actual = Math.max(0, usage.totalTokens());
+        if (usage.estimated() && canQueryMissingUsage(reservation.projectId())) {
+            Boolean queued = transactions.execute(status -> {
+                var attempts = jdbc.queryForList("select attempt_id,provider_generation_id from usage_provider_attempt where reservation_id=? and attempt_no=1", reservation.reservationId());
+                if (attempts.isEmpty() || attempts.getFirst().get("provider_generation_id") == null) return false;
+                var states = jdbc.query("select status from usage_reservation where reservation_id=? for update", (rs, row) -> rs.getString(1), reservation.reservationId());
+                if (states.isEmpty() || isFinal(states.getFirst())) return false;
+                Instant now = Instant.now(); Instant deadline = now.plus(properties.usageQueryDeadline());
+                Map<String, Object> attempt = attempts.getFirst();
+                // The unique reservation key makes repeated cancellation finalizers schedule one lookup.
+                jdbc.update("insert into usage_lookup_task(task_id,reservation_id,attempt_id,provider_generation_id,usage_query_path,provider_base_url,status,next_attempt_at,deadline_at,created_at,updated_at) values(?,?,?,?,?,?,'PENDING',?,?,?,?)", UUID.randomUUID().toString(), reservation.reservationId(), attempt.get("attempt_id"), attempt.get("provider_generation_id"), usageQueryPath(reservation.projectId()), settlementEndpoint(reservation.projectId()).get("base_url"), now, deadline, now, now);
+                jdbc.update("insert into usage_quota_task(task_id,reservation_id,operation_id,action_type,token_value,status,next_attempt_at,created_at,updated_at) values(?,?,?,?,?,'PENDING',?,?,?)", UUID.randomUUID().toString(), reservation.reservationId(), UUID.randomUUID().toString(), "RELEASE_ACTIVE", 0, now, now, now);
+                jdbc.update("update usage_reservation set actual_tokens=?,input_tokens=?,output_tokens=?,usage_source='ESTIMATED_PENDING',estimator_version='heuristic-v1',status='SETTLEMENT_PENDING',settlement_status='PENDING',execution_outcome=?,settlement_deadline=?,prompt_version=?,updated_at=? where reservation_id=?", actual, usage.inputTokens(), usage.outputTokens(), terminalStatus, deadline, promptVersion, now, reservation.reservationId());
+                return true;
+            });
+            if (Boolean.TRUE.equals(queued)) {
+                Long released = redis.execute(RELEASE_ACTIVE, List.of(quotaKey(reservation.projectId()), markerKey(reservation.reservationId())), Long.toString(properties.usageQueryDeadline().toMillis()));
+                if (released == null || released == 0L) jdbc.update("update usage_reservation set quota_sync_status='FAILED',failure_code='REDIS_RELEASE_ACTIVE_FAILED',updated_at=? where reservation_id=?", Instant.now(), reservation.reservationId());
+                return;
+            }
+        }
         Boolean written = transactions.execute(status -> {
             var states = jdbc.query("select status from usage_reservation where reservation_id=? for update", (rs, row) -> rs.getString(1), reservation.reservationId());
             if (states.isEmpty() || isFinal(states.getFirst())) return false;
@@ -108,37 +139,62 @@ public final class UsageService {
             UsageLedgerEvent event = new UsageLedgerEvent(ledgerId, reservation.projectId(), reservation.reservationId(), type, actual, BigDecimal.ZERO, promptVersion, now);
             jdbc.update("insert into usage_outbox(event_id,ledger_id,event_key,payload_json,status,next_attempt_at,created_at) values(?,?,?,?, 'PENDING',?,?)",
                     UUID.randomUUID().toString(), ledgerId, ledgerId, json(event), now, now);
-            String finalState = usage.estimated() ? "RECONCILIATION_PENDING" : terminalStatus;
-            jdbc.update("update usage_reservation set actual_tokens=?,usage_source=?,status=?,prompt_version=?,updated_at=? where reservation_id=?",
-                    actual, usage.estimated() ? "ESTIMATED" : "PROVIDER", finalState, promptVersion, now, reservation.reservationId());
+            jdbc.update("insert into usage_quota_task(task_id,reservation_id,operation_id,action_type,token_value,status,next_attempt_at,created_at,updated_at) values(?,?,?,?,?,'PENDING',?,?,?)", UUID.randomUUID().toString(), reservation.reservationId(), ledgerId, "FINALIZE", actual, now, now, now);
+            jdbc.update("update usage_reservation set actual_tokens=?,input_tokens=?,output_tokens=?,usage_source=?,status=?,settlement_status='FINAL',execution_outcome=?,estimator_version=?,prompt_version=?,updated_at=? where reservation_id=?",
+                    actual, usage.inputTokens(), usage.outputTokens(), usage.estimated() ? "ESTIMATED" : "PROVIDER_STREAM", terminalStatus, terminalStatus, usage.estimated() ? "heuristic-v1" : null, promptVersion, now, reservation.reservationId());
             return true;
         });
         if (Boolean.TRUE.equals(written)) {
             Long released = redis.execute(FINALIZE, List.of(quotaKey(reservation.projectId()), markerKey(reservation.reservationId())), Long.toString(actual), "300000");
-            if (released == null || released == 0L) jdbc.update("update usage_reservation set status='RECONCILIATION_PENDING',failure_code='REDIS_FINALIZE_FAILED',updated_at=? where reservation_id=?", Instant.now(), reservation.reservationId());
+            if (released == null || released == 0L) jdbc.update("update usage_reservation set quota_sync_status='FAILED',failure_code='REDIS_FINALIZE_FAILED',updated_at=? where reservation_id=?", Instant.now(), reservation.reservationId());
         }
     }
 
+    /** Persists a just-observed provider ID before choosing queryable or estimated settlement. */
+    public void finalizeReservation(Reservation reservation, ConfirmedUsage usage, String terminalStatus, String promptVersion, String providerGenerationId) {
+        recordProviderGenerationId(reservation.reservationId(), providerGenerationId);
+        finalizeReservation(reservation, usage, terminalStatus, promptVersion);
+    }
+
+    /** Returns true only when a configured endpoint can retrieve final request-level usage. */
+    private boolean canQueryMissingUsage(String projectId) {
+        Map<String, Object> endpoint = settlementEndpoint(projectId);
+        return SettlementMode.QUERYABLE.name().equalsIgnoreCase(String.valueOf(endpoint.get("settlement_mode")))
+                && endpoint.get("usage_query_path") != null && !endpoint.get("usage_query_path").toString().isBlank();
+    }
+
+    /** Returns the configured usage-query path for the exact project endpoint chosen for this request. */
+    private String usageQueryPath(String projectId) { return settlementEndpoint(projectId).get("usage_query_path").toString(); }
+
+    /** Returns the configured inference origin from the deterministic settlement endpoint. */
+    public String providerBaseUrl(String projectId) { return settlementEndpoint(projectId).get("base_url").toString(); }
+
+    private Map<String, Object> settlementEndpoint(String projectId) {
+        var rows = jdbc.queryForList("select provider_id,base_url,settlement_mode,usage_query_path from provider_config where project_id=? and enabled=true order by provider_id limit 1", projectId);
+        if (rows.isEmpty()) throw new GatewayException("PROVIDER_NOT_CONFIGURED", HttpStatus.SERVICE_UNAVAILABLE, "No enabled provider endpoint is configured");
+        return rows.getFirst();
+
+    }
     /** Returns the current reservation view for diagnostics. */
     public Map<String, Object> queryRequest(String projectId, String requestId) {
-        return jdbc.queryForMap("select request_id,correlation_id,reservation_id,project_id,reserved_tokens,actual_tokens,status,usage_source,prompt_version,created_at,updated_at from usage_reservation where request_id=? and project_id=?", requestId, projectId);
+        return jdbc.queryForMap("select request_id,correlation_id,reservation_id,project_id,reserved_tokens,actual_tokens,input_tokens,output_tokens,status,settlement_status,execution_outcome,usage_source,estimator_version,settlement_deadline,quota_sync_status,prompt_version,failure_code,created_at,updated_at from usage_reservation where request_id=? and project_id=?", requestId, projectId);
     }
 
     /** Aggregates every provider call made by one upstream Agent run in chronological order. */
     public Map<String, Object> queryRun(String projectId, String correlationId) {
         List<Map<String, Object>> calls = jdbc.queryForList("""
-                select r.request_id,r.reservation_id,r.reserved_tokens,r.actual_tokens,r.status,r.usage_source,
+                select r.request_id,r.reservation_id,r.reserved_tokens,r.actual_tokens,r.status,r.settlement_status,r.execution_outcome,r.quota_sync_status,r.usage_source,
                        r.prompt_version,r.failure_code,r.created_at,r.updated_at,
                        coalesce(sum(l.token_delta),0) ledger_tokens,count(l.ledger_id) ledger_entries
                 from usage_reservation r left join usage_ledger l on l.reservation_id=r.reservation_id
                 where r.project_id=? and r.correlation_id=?
-                group by r.request_id,r.reservation_id,r.reserved_tokens,r.actual_tokens,r.status,r.usage_source,
+                group by r.request_id,r.reservation_id,r.reserved_tokens,r.actual_tokens,r.status,r.settlement_status,r.execution_outcome,r.quota_sync_status,r.usage_source,
                          r.prompt_version,r.failure_code,r.created_at,r.updated_at
                 order by r.created_at
                 """, projectId, correlationId);
         long actualTokens = calls.stream().mapToLong(call -> number(call.get("actual_tokens"))).sum();
         long reservedTokens = calls.stream().mapToLong(call -> number(call.get("reserved_tokens"))).sum();
-        boolean settled = !calls.isEmpty() && calls.stream().allMatch(call -> isFinal(String.valueOf(call.get("status"))));
+        boolean settled = !calls.isEmpty() && calls.stream().allMatch(call -> "FINAL".equals(call.get("settlement_status")));
         return Map.of("correlationId", correlationId, "modelCallCount", calls.size(), "reservedTokens", reservedTokens,
                 "actualTokens", actualTokens, "settled", settled, "calls", calls);
     }
@@ -148,7 +204,7 @@ public final class UsageService {
         return jdbc.queryForList("""
                 select correlation_id,count(*) model_call_count,sum(reserved_tokens) reserved_tokens,
                        sum(coalesce(actual_tokens,0)) actual_tokens,min(created_at) started_at,max(updated_at) updated_at,
-                       case when sum(status in ('PENDING','RESERVED'))=0 then 'FINAL' else 'IN_PROGRESS' end settlement_status,
+                       case when sum(settlement_status<>'FINAL')=0 then 'FINAL' else 'IN_PROGRESS' end settlement_status,
                        max(prompt_version) prompt_version
                 from usage_reservation where project_id=? group by correlation_id
                 order by max(created_at) desc limit ?
@@ -166,18 +222,20 @@ public final class UsageService {
     public Map<String, Object> adjustEstimatedUsage(String projectId, String requestId, long correctedTokens) {
         if (correctedTokens < 0) throw new IllegalArgumentException("correctedTokens must be non-negative");
         return transactions.execute(status -> {
-            Map<String, Object> reservation = jdbc.queryForMap("select reservation_id,project_id,actual_tokens,prompt_version,status from usage_reservation where request_id=? and project_id=? for update", requestId, projectId);
-            if (!"RECONCILIATION_PENDING".equals(reservation.get("status"))) throw new GatewayException("USAGE_NOT_ADJUSTABLE", HttpStatus.CONFLICT, "Only estimated usage can be adjusted");
+            Map<String, Object> reservation = jdbc.queryForMap("select reservation_id,project_id,actual_tokens,prompt_version,status,usage_source,settlement_status from usage_reservation where request_id=? and project_id=? for update", requestId, projectId);
+            if (!"ESTIMATED".equals(reservation.get("usage_source")) || !"FINAL".equals(reservation.get("settlement_status"))) throw new GatewayException("USAGE_NOT_ADJUSTABLE", HttpStatus.CONFLICT, "Only final estimated usage can be adjusted");
             String reservationId = reservation.get("reservation_id").toString(); String reservationProjectId = reservation.get("project_id").toString();
             Map<String, Object> original = jdbc.queryForMap("select ledger_id,token_delta from usage_ledger where reservation_id=? and ledger_type='USAGE_ESTIMATED' order by occurred_at limit 1", reservationId);
-            long previous = ((Number) original.get("token_delta")).longValue(); long delta = correctedTokens - previous;
+            Long current = jdbc.queryForObject("select coalesce(sum(token_delta),0) from usage_ledger where reservation_id=?", Long.class, reservationId);
+            long delta = correctedTokens - (current == null ? 0 : current);
             String ledgerId = UUID.randomUUID().toString(); Instant now = Instant.now(); String prompt = (String) reservation.get("prompt_version");
             jdbc.update("insert into usage_ledger(ledger_id,reservation_id,project_id,ledger_type,related_ledger_id,token_delta,cost_delta,prompt_version,occurred_at) values(?,?,?,'USAGE_ADJUSTMENT',?,?,0,?,?)",
                     ledgerId, reservationId, reservationProjectId, original.get("ledger_id"), delta, prompt, now);
             UsageLedgerEvent event = new UsageLedgerEvent(ledgerId, reservationProjectId, reservationId, "USAGE_ADJUSTMENT", delta, BigDecimal.ZERO, prompt, now);
             jdbc.update("insert into usage_outbox(event_id,ledger_id,event_key,payload_json,status,next_attempt_at,created_at) values(?,?,?,?, 'PENDING',?,?)",
                     UUID.randomUUID().toString(), ledgerId, ledgerId, json(event), now, now);
-            jdbc.update("update usage_reservation set actual_tokens=?,usage_source='ADJUSTED',status='SETTLED',updated_at=? where reservation_id=?", correctedTokens, now, reservationId);
+            jdbc.update("insert into usage_quota_task(task_id,reservation_id,operation_id,action_type,token_value,status,next_attempt_at,created_at,updated_at) values(?,?,?,?,?,'PENDING',?,?,?)", UUID.randomUUID().toString(), reservationId, ledgerId, "ADJUST", delta, now, now, now);
+            jdbc.update("update usage_reservation set actual_tokens=?,usage_source='MANUAL',settlement_status='FINAL',updated_at=? where reservation_id=?", correctedTokens, now, reservationId);
             return Map.of("requestId", requestId, "relatedLedgerId", original.get("ledger_id"), "adjustmentLedgerId", ledgerId, "tokenDelta", delta, "correctedTokens", correctedTokens);
         });
     }

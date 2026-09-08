@@ -12,10 +12,14 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -97,6 +101,11 @@ class UsageGatewayIT {
     void resetMutableState() {
         providerMode = ProviderMode.ORDINARY;
         providerResponseBody = "{}";
+        // Routing reads the persisted endpoint; use this test's controlled provider.
+        jdbc.update("update provider_config set base_url=?,settlement_mode='ESTIMATE_FALLBACK',usage_query_path=null where project_id=?", providerBaseUrl(), PROJECT_ID);
+        jdbc.update("delete from usage_lookup_task");
+        jdbc.update("delete from usage_quota_task");
+        jdbc.update("delete from usage_provider_attempt");
         jdbc.update("delete from usage_reconciliation");
         jdbc.update("delete from usage_projection_applied");
         jdbc.update("delete from usage_projection");
@@ -149,6 +158,37 @@ class UsageGatewayIT {
         assertThat(redisCounter("consumed")).isEqualTo(30);
     }
 
+    /** Starts two requests with one business key at the same time; only one may create a charge. */
+    @Test
+    void rejectsConcurrentIdempotencyRetryWithoutDoubleCharging() throws Exception {
+        stubOrdinaryUsage(20, 10);
+        String requestId = UUID.randomUUID().toString();
+        CountDownLatch clientsReady = new CountDownLatch(2);
+        CountDownLatch startTogether = new CountDownLatch(1);
+
+        CompletableFuture<Integer> first = CompletableFuture.supplyAsync(
+                () -> sendConcurrentRequest(requestId, clientsReady, startTogether));
+        CompletableFuture<Integer> second = CompletableFuture.supplyAsync(
+                () -> sendConcurrentRequest(requestId, clientsReady, startTogether));
+
+        assertThat(clientsReady.await(5, TimeUnit.SECONDS)).isTrue();
+        startTogether.countDown();
+        List<Integer> statuses = List.of(first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
+
+        assertThat(statuses).containsExactlyInAnyOrder(200, 409);
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            Map<String, Object> reservation = queryReservation(requestId);
+            assertThat(reservation.get("status")).isEqualTo("SETTLED");
+            assertThat(((Number) reservation.get("actual_tokens")).longValue()).isEqualTo(30);
+            assertThat(jdbc.queryForObject("select count(*) from usage_reservation where idempotency_key=?", Integer.class,
+                    requestId)).isEqualTo(1);
+            assertThat(jdbc.queryForObject("select count(*) from usage_ledger where reservation_id=?", Integer.class,
+                    reservation.get("reservation_id"))).isEqualTo(1);
+            assertThat(redisCounter("consumed")).isEqualTo(30);
+            assertThat(redisCounter("reserved")).isZero();
+            assertThat(redisCounter("active")).isZero();
+        });
+    }
     /** Proves cancelling a partial SSE response still closes quota and persists an auditable estimate. */
     @Test
     void cancelsPartialStreamWithoutLeakingQuota() {
@@ -192,6 +232,24 @@ class UsageGatewayIT {
                 .exchange();
     }
 
+    /** Coordinates one real HTTP client with its peer, then returns 409 as a normal test result. */
+    private int sendConcurrentRequest(String requestId, CountDownLatch clientsReady, CountDownLatch startTogether) {
+        clientsReady.countDown();
+        try {
+            if (!startTogether.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Concurrent start was not released");
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Concurrent client was interrupted", exception);
+        }
+        return WebClient.create("http://localhost:" + port).post().uri("/v1/chat/completions")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + API_KEY)
+                .header("Idempotency-Key", requestId).header("X-AgentOps-Request-Id", requestId)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("model", "deterministic-fund-model", "stream", false, "max_tokens", 128,
+                        "messages", new Object[]{Map.of("role", "user", "content", "并发幂等测试")}))
+                .exchangeToMono(response -> response.bodyToMono(Void.class).thenReturn(response.statusCode().value()))
+                .block(Duration.ofSeconds(10));
+    }
     /** Returns the persisted reservation using the public diagnostic contract. */
     private Map<String, Object> queryReservation(String requestId) {
         return client.get().uri("/internal/v1/usage/queryRequest/{requestId}", requestId)

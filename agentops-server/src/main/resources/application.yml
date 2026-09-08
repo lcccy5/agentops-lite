@@ -25,6 +25,11 @@ agentops:
   safety-margin-tokens: 128
   reservation-timeout: 2m
   stream-buffer-size: 64
+  # QUERYABLE requires a provider generation ID and an endpoint returning final request usage.
+  provider-settlement-mode: ${PROVIDER_SETTLEMENT_MODE:ESTIMATE_FALLBACK}
+  provider-usage-query-path: ${PROVIDER_USAGE_QUERY_PATH:}
+  usage-query-deadline: ${USAGE_QUERY_DEADLINE:15m}
+  usage-query-retry-limit: ${USAGE_QUERY_RETRY_LIMIT:6}
 resilience4j.circuitbreaker.instances.provider:
   sliding-window-size: 20
   minimum-number-of-calls: 5

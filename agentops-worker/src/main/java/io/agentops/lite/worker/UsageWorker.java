@@ -3,15 +3,12 @@ package io.agentops.lite.worker;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.agentops.lite.contract.Contracts.UsageLedgerEvent;
 import java.math.BigDecimal;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
-import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -22,19 +19,18 @@ import org.springframework.transaction.support.TransactionTemplate;
 /** Relays immutable usage facts, applies idempotent projections and reports recoverable discrepancies. */
 @Component
 public final class UsageWorker {
-    private static final DefaultRedisScript<Long> COMPENSATE = compensationScript();
-    /** Matches Server in-flight stub TTL so a COMPENSATED claim survives retries after a missing stub. */
-    private static final String COMPENSATION_MARKER_TTL_MS = Long.toString(Duration.ofDays(7).toMillis());
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     private final KafkaTemplate<String, String> kafka;
     private final StringRedisTemplate redis;
     private final ObjectMapper mapper;
+    private final WorkerProperties properties;
 
     /** Creates the usage background worker. */
     public UsageWorker(JdbcTemplate jdbc, TransactionTemplate transactions, KafkaTemplate<String, String> kafka,
-                       StringRedisTemplate redis, ObjectMapper mapper) {
+                       StringRedisTemplate redis, ObjectMapper mapper, WorkerProperties properties) {
         this.jdbc = jdbc; this.transactions = transactions; this.kafka = kafka; this.redis = redis; this.mapper = mapper;
+        this.properties = properties;
     }
 
     /** Publishes pending outbox rows and marks only acknowledged records as published. */
@@ -76,13 +72,28 @@ public final class UsageWorker {
     @Scheduled(fixedDelayString = "${agentops.worker.recovery-delay-ms:10000}")
     public void reconcileUsage() {
         Instant now = Instant.now();
-        for (Map<String, Object> expired : jdbc.queryForList("select reservation_id,project_id,status,provider_started,reserved_tokens from usage_reservation where status in ('PENDING','RESERVED') and expires_at<? limit 200", now)) {
+        // PROCESSING quota tasks have no external lease; stale rows are safe to replay through idempotent Lua.
+        jdbc.update("update usage_quota_task set status='PENDING',next_attempt_at=?,updated_at=? where status='PROCESSING' and updated_at<?", now, now, now.minusSeconds(60));
+
+        for (Map<String, Object> expired : jdbc.queryForList("""
+                select r.reservation_id,r.project_id,r.status,r.provider_started,r.reserved_tokens,
+                       a.attempt_id,a.provider_generation_id,p.settlement_mode,p.usage_query_path,p.base_url
+                from usage_reservation r
+                left join usage_provider_attempt a on a.reservation_id=r.reservation_id and a.attempt_no=1
+                left join provider_config p on p.provider_id=a.provider_endpoint_id
+                where r.status in ('PENDING','RESERVED') and r.expires_at<? limit 200
+                """, now)) {
             String reservationId = expired.get("reservation_id").toString();
-            Long released = compensateExpiredHold(expired);
             boolean providerStarted = Boolean.TRUE.equals(expired.get("provider_started"));
-            String nextStatus = providerStarted ? "RECONCILIATION_PENDING" : "CANCELLED";
-            String code = released != null && released == 1L ? "RESERVATION_EXPIRED_COMPENSATED" : "RESERVATION_EXPIRED_MARKER_MISSING";
-            jdbc.update("update usage_reservation set status=?,failure_code=?,updated_at=? where reservation_id=? and status in ('PENDING','RESERVED')", nextStatus, code, now, reservationId);
+            if (providerStarted) {
+                if (!enqueueProviderRecovery(expired, now)) markMissingProviderId(expired, now);
+                continue;
+            }
+            transactions.executeWithoutResult(status -> {
+                if (jdbc.update("update usage_reservation set status='CANCELLED',settlement_status='FINAL',execution_outcome='CANCELLED',failure_code='RESERVATION_EXPIRED',updated_at=? where reservation_id=? and status in ('PENDING','RESERVED')", now, reservationId) != 1) return;
+                jdbc.update("insert into usage_quota_task(task_id,reservation_id,operation_id,action_type,token_value,status,next_attempt_at,created_at,updated_at) values(?,?,?,?,?,'PENDING',?,?,?)",
+                        UUID.randomUUID().toString(), reservationId, "expiry-compensate:" + reservationId, "COMPENSATE", expired.get("reserved_tokens"), now, now, now);
+            });
         }
         for (Map<String, Object> project : jdbc.queryForList("select project_id from agent_project")) {
             String projectId = project.get("project_id").toString();
@@ -96,31 +107,38 @@ public final class UsageWorker {
         }
     }
 
-    /**
-     * Releases the Redis hold for one expired MySQL reservation.
-     * A RESERVED row is proof Lua already incremented quota, so the stub is optional.
-     * A PENDING row still needs the stub; otherwise this would refund a crash that never reached Redis.
-     *
-     * @param expired reservation row containing reservation_id, project_id, status and reserved_tokens
-     * @return 1 when quota and concurrency were released, or 0 when this hold was already gone or never taken
-     */
-    private Long compensateExpiredHold(Map<String, Object> expired) {
-        String reservationId = expired.get("reservation_id").toString();
-        String projectId = expired.get("project_id").toString();
-        String tokens = Long.toString(((Number) expired.get("reserved_tokens")).longValue());
-        String allowWithoutStub = "RESERVED".equals(String.valueOf(expired.get("status"))) ? "1" : "0";
-        return redis.execute(COMPENSATE, List.of("agentops:quota:" + projectId, "agentops:reservation:" + reservationId),
-                COMPENSATION_MARKER_TTL_MS, tokens, allowWithoutStub);
+    /** Releases only concurrency when provider execution started but no query identifier was captured. */
+    private void markMissingProviderId(Map<String, Object> expired, Instant now) {
+        transactions.executeWithoutResult(status -> {
+            String reservationId = expired.get("reservation_id").toString();
+            if (jdbc.update("update usage_reservation set status='SETTLEMENT_PENDING',settlement_status='PENDING',execution_outcome='UNKNOWN',failure_code='ID_UNAVAILABLE',updated_at=? where reservation_id=? and status in ('PENDING','RESERVED')", now, reservationId) != 1) return;
+            jdbc.update("insert into usage_quota_task(task_id,reservation_id,operation_id,action_type,token_value,status,next_attempt_at,created_at,updated_at) values(?,?,?,?,?,'PENDING',?,?,?)",
+                    UUID.randomUUID().toString(), reservationId, "missing-id-release-active:" + reservationId, "RELEASE_ACTIVE", 0, now, now, now);
+        });
     }
-
+    /** Converts an expired started call with durable provider evidence into one query and quota task. */
+    private boolean enqueueProviderRecovery(Map<String, Object> expired, Instant now) {
+        Object generationId = expired.get("provider_generation_id");
+        Object queryPath = expired.get("usage_query_path");
+        if (!"QUERYABLE".equals(String.valueOf(expired.get("settlement_mode"))) || generationId == null
+                || queryPath == null || queryPath.toString().isBlank()) return false;
+        Boolean queued = transactions.execute(status -> {
+            String reservationId = expired.get("reservation_id").toString();
+            Instant deadline = now.plus(properties.usageQueryDeadline());
+            if (jdbc.update("update usage_reservation set status='SETTLEMENT_PENDING',settlement_status='PENDING',execution_outcome='UNKNOWN',settlement_deadline=?,failure_code='RECOVERED_AFTER_EXPIRY',updated_at=? where reservation_id=? and status in ('PENDING','RESERVED')", deadline, now, reservationId) != 1) return false;
+            jdbc.update("insert into usage_lookup_task(task_id,reservation_id,attempt_id,provider_generation_id,usage_query_path,provider_base_url,status,next_attempt_at,deadline_at,created_at,updated_at) values(?,?,?,?,?,?,'PENDING',?,?,?,?)",
+                    UUID.randomUUID().toString(), reservationId, expired.get("attempt_id"), generationId, queryPath, expired.get("base_url"), now, deadline, now, now);
+            jdbc.update("insert into usage_quota_task(task_id,reservation_id,operation_id,action_type,token_value,status,next_attempt_at,created_at,updated_at) values(?,?,?,?,?,'PENDING',?,?,?)",
+                    UUID.randomUUID().toString(), reservationId, "recovery-release-active:" + reservationId, "RELEASE_ACTIVE", 0, now, now, now);
+            return true;
+        });
+        return Boolean.TRUE.equals(queued);
+    }
     private boolean alreadyOpen(String project, String type, long expected, long actual) {
         Integer count = jdbc.queryForObject("select count(*) from usage_reconciliation where project_id=? and discrepancy_type=? and expected_value=? and actual_value=? and detected_at>?", Integer.class, project, type, expected, actual, Instant.now().minusSeconds(60));
         return count != null && count > 0;
     }
     private void discrepancy(String project, String type, long expected, long actual, String suggestion) {
         jdbc.update("insert into usage_reconciliation(reconciliation_id,project_id,discrepancy_type,expected_value,actual_value,suggested_action,detected_at) values(?,?,?,?,?,?,?)", UUID.randomUUID().toString(), project, type, expected, actual, suggestion, Instant.now());
-    }
-    private static DefaultRedisScript<Long> compensationScript() {
-        DefaultRedisScript<Long> script = new DefaultRedisScript<>(); script.setLocation(new ClassPathResource("lua/compensate.lua")); script.setResultType(Long.class); return script;
     }
 }

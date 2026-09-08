@@ -10,7 +10,7 @@
 |---|---|
 | 多轮 Agent 一次运行会触发多少模型调用 | 使用 Correlation ID 聚合调用，同时按每次请求独立结算 |
 | 并发请求是否会突破额度 | MySQL 先记事实，Redis Lua 原子预占 Token 与并发许可 |
-| SSE 中途断开是否泄漏额度 | 响应取消不取消独立结算，Worker 扫描过期状态兜底 |
+| SSE 中途断开是否泄漏额度 | 真实 usage 立即结算；可查询渠道保留预占并异步核验，其他渠道按已捕获内容估算 |
 | Kafka 重复投递是否重复记账 | 不可变 Ledger + 业务唯一键 + 幂等 Projection |
 | Prompt 修改后质量是否退化 | Stable/Candidate 使用同一数据集执行确定性四维评分 |
 | 新 Prompt 是否可以直接全量 | Gate 通过后才能创建 0%/5%/100% Release |
@@ -45,7 +45,7 @@ MySQL 是 Reservation、Ledger、Prompt、Eval 和 Release 的事实源；Redis 
 
 ```text
 API Key → MySQL PENDING → Redis Lua 原子预占 → MySQL RESERVED
-→ Provider 普通响应或 SSE → 独立结算 → 不可变 Ledger + Outbox
+→ Provider 普通响应或 SSE → 最终 usage 或异步核验/估算 → 不可变 Ledger + Outbox
 → Kafka → 幂等 Projection
 ```
 
@@ -233,6 +233,8 @@ Docker 未运行时，集成测试会失败并提醒启动 Docker；这是为了
 | 回滚发布 | `POST /internal/v1/releases/rollbackRelease/{releaseId}` |
 | 查询一次 Agent 运行 | `GET /internal/v1/usage/queryRun/{correlationId}` |
 | 查询账本与投影汇总 | `GET /internal/v1/usage/querySummary` |
+| 查询单请求结算状态 | `GET /internal/v1/usage/queryRequest/{requestId}` |
+| 追加估算用量校正 | `POST /internal/v1/usage/adjustEstimatedRequest/{requestId}` |
 
 本地开发凭据为 `agentops-dev-key` 和 `local-admin-token`，只用于本地演示。
 
@@ -254,6 +256,7 @@ scripts                启动、演示、故障注入和验证脚本
 - MySQL 是事实源；Redis 和 Kafka 都可以从数据库事实恢复。
 - Redis 成功后的崩溃可以从 `PENDING` Reservation 与长生命周期 Marker 判断是否需要补偿。
 - 原始 Ledger 不修改；估算用量修正通过追加 `USAGE_ADJUSTMENT` 完成。
+- Provider 可查询端点会保存 generation ID 并限期查询最终 usage；不支持查询的端点只按已捕获内容估算。详见 [双模式用量结算实施说明](docs/USAGE-SETTLEMENT-IMPLEMENTATION.md)。
 - Kafka 投影采用至少一次投递语义，通过 Ledger ID 保证业务幂等。
 - WireMock 与 Toxiproxy 证明治理逻辑可以复现，不代表生产流量。
 - 确定性通道不等于真实模型质量提升。真实 Prompt 对比必须保存模型名、温度、时间和 24 条原始结果。

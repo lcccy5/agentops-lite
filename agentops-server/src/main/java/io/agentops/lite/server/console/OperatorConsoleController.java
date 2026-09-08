@@ -65,9 +65,11 @@ public final class OperatorConsoleController {
         for (Map<String, Object> call : calls) {
             rows.append("<tr><td>").append(shortId(value(call, "request_id")))
                     .append("</td><td>").append(escape(value(call, "status")))
+                    .append("</td><td>").append(escape(value(call, "settlement_status")))
                     .append("</td><td>").append(escape(value(call, "reserved_tokens")))
                     .append("</td><td>").append(escape(value(call, "actual_tokens")))
                     .append("</td><td>").append(escape(value(call, "usage_source")))
+                    .append("</td><td>").append(escape(value(call, "quota_sync_status")))
                     .append("</td><td>").append(escape(value(call, "failure_code"))).append("</td></tr>");
         }
         String cards = "<div class='cards'><div><b>模型调用</b><strong>" + run.get("modelCallCount")
@@ -75,7 +77,7 @@ public final class OperatorConsoleController {
                 + "</strong></div><div><b>实际 Token</b><strong>" + run.get("actualTokens")
                 + "</strong></div><div><b>全部结算</b><strong>" + run.get("settled") + "</strong></div></div>";
         return page("运行详情", "Correlation ID · " + escape(correlationId), cards
-                + table(List.of("Request ID", "状态", "预占", "实际", "用量来源", "失败码"), rows), project(exchange));
+                + table(List.of("Request ID", "执行状态", "结算状态", "预占", "实际", "用量来源", "Redis 同步", "失败码"), rows), project(exchange));
     }
 
     /** Lists deterministic evaluation jobs and their release gate decisions. */

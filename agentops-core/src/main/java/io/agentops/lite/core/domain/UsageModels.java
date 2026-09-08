@@ -8,10 +8,13 @@ public final class UsageModels {
     private UsageModels() { }
 
     /** Database-visible reservation lifecycle. */
-    public enum ReservationStatus { PENDING, RESERVED, SETTLED, CANCELLED, FAILED, REJECTED, RECONCILIATION_PENDING }
+    public enum ReservationStatus { PENDING, RESERVED, SETTLED, CANCELLED, FAILED, REJECTED, RECONCILIATION_PENDING, SETTLEMENT_PENDING }
 
     /** Immutable ledger entry kinds; corrections are appended as adjustments. */
     public enum LedgerType { USAGE_ACTUAL, USAGE_ESTIMATED, USAGE_ADJUSTMENT, RESERVATION_RELEASE }
+
+    /** Defines whether missing terminal stream usage may be recovered from the provider. */
+    public enum SettlementMode { ESTIMATE_FALLBACK, QUERYABLE }
 
     /** Admission result required before a provider can be called. */
     public record Reservation(String reservationId, String requestId, String projectId,

@@ -12,7 +12,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ServerWebExchange;
 
-/** Read-only management endpoints for auditable usage facts and reconciliation findings. */
+/** Management endpoints for auditable usage facts, reconciliation findings, and append-only corrections. */
 @RestController
 @RequestMapping("/internal/v1/usage")
 public final class UsageQueryController {
