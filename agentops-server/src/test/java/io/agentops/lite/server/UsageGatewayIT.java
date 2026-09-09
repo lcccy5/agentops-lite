@@ -1,17 +1,23 @@
 package io.agentops.lite.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.agentops.lite.core.domain.UsageModels.ConfirmedUsage;
+import io.agentops.lite.core.domain.UsageModels.Reservation;
+import io.agentops.lite.core.domain.UsageModels.ReservationStatus;
+import io.agentops.lite.server.usage.UsageService;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -53,7 +59,8 @@ class UsageGatewayIT {
 
     @Container
     private static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4")
-            .withDatabaseName("agentops").withUsername("agentops").withPassword("agentops");
+            .withDatabaseName("agentops").withUsername("agentops").withPassword("agentops")
+            .withCommand("--log-bin-trust-function-creators=1");
 
     @Container
     private static final GenericContainer<?> REDIS = new GenericContainer<>(DockerImageName.parse("redis:7.4-alpine"))
@@ -95,6 +102,9 @@ class UsageGatewayIT {
 
     @Autowired
     private ObjectMapper mapper;
+
+    @Autowired
+    private UsageService usageService;
 
     /** Resets mutable facts while preserving Flyway's local project and API-key seed. */
     @BeforeEach
@@ -142,6 +152,42 @@ class UsageGatewayIT {
         });
     }
 
+    /** Injects an Outbox insert failure and proves a MySQL transaction never leaves a lone ledger row behind. */
+    @Test
+    void rollsBackLedgerAndOutboxTogetherWhenOutboxInsertFails() {
+        final int attempts = Integer.getInteger("billing.sample.count", 10);
+        jdbc.execute("drop trigger if exists usage_outbox_atomicity_fail");
+        jdbc.execute("create trigger usage_outbox_atomicity_fail before insert on usage_outbox for each row "
+                + "signal sqlstate '45000' set message_text = 'injected outbox failure'");
+        try {
+            for (int index = 0; index < attempts; index++) {
+                String reservationId = UUID.randomUUID().toString();
+                String requestId = UUID.randomUUID().toString();
+                Instant now = Instant.now();
+                jdbc.update("""
+                        insert into usage_reservation(reservation_id,request_id,correlation_id,project_id,idempotency_key,
+                            reserved_tokens,status,expires_at,created_at,updated_at)
+                        values(?,?,?,?,?,?,'RESERVED',?,?,?)
+                        """, reservationId, requestId, reservationId, PROJECT_ID, "atomicity-" + reservationId,
+                        64, now.plusSeconds(30), now, now);
+                Reservation reservation = new Reservation(reservationId, requestId, PROJECT_ID,
+                        "atomicity-" + reservationId, 64, ReservationStatus.RESERVED, now.plusSeconds(30));
+
+                assertThatThrownBy(() -> usageService.finalizeReservation(reservation,
+                        new ConfirmedUsage(20, 10, false), "COMPLETED", "atomicity-test"))
+                        .hasMessageContaining("injected outbox failure");
+            }
+
+            assertThat(jdbc.queryForObject("select count(*) from usage_ledger", Integer.class)).isZero();
+            assertThat(jdbc.queryForObject("select count(*) from usage_outbox", Integer.class)).isZero();
+            assertThat(jdbc.queryForObject("select count(*) from usage_quota_task", Integer.class)).isZero();
+            assertThat(jdbc.queryForObject("select count(*) from usage_reservation where status='RESERVED'", Integer.class))
+                    .isEqualTo(attempts);
+            System.out.printf("MySQL atomicity result: injectedOutboxFailures=%d, partialLedgers=0, partialOutboxRows=0%n", attempts);
+        } finally {
+            jdbc.execute("drop trigger if exists usage_outbox_atomicity_fail");
+        }
+    }
     /** Proves a repeated business key cannot create a second reservation, ledger or charge. */
     @Test
     void rejectsFinalizedIdempotencyKeyWithoutDoubleCharging() {
@@ -175,6 +221,7 @@ class UsageGatewayIT {
         startTogether.countDown();
         List<Integer> statuses = List.of(first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
 
+        System.out.printf("Concurrent idempotency result: requestId=%s, HTTP statuses=%s%n", requestId, statuses);
         assertThat(statuses).containsExactlyInAnyOrder(200, 409);
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             Map<String, Object> reservation = queryReservation(requestId);

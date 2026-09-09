@@ -69,8 +69,10 @@ try {
     $valid=@($rows | Where-Object faultTriggered)
     $repaired=@($valid | Where-Object repaired)
     $times=@($repaired | ForEach-Object eventToObservedRepairMs | Sort-Object)
+    $p50=if ($times.Count) { $times[[int][Math]::Ceiling(0.50*$times.Count)-1] } else { $null }
     $p95=if ($times.Count) { $times[[int][Math]::Ceiling(0.95*$times.Count)-1] } else { $null }
-    @{runId=$runId;requestedSamples=$Samples;attempted=$rows.Count;validSamples=$valid.Count;repaired=$repaired.Count;invalidSamples=$rows.Count-$valid.Count;unrepaired=$valid.Count-$repaired.Count;observedP95Ms=$p95;error=$failure;timing='Ledger occurred_at (before commit) to observed Redis convergence and APPLIED task. Includes polling and docker exec overhead; not exact commit-to-repair latency.';pollSleepMs=200;recoveryDelayMs=10000;providerDelayMs=6000;claim='Functional fault verification; small sample is not a resume performance benchmark.'} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir 'summary.json') -Encoding utf8
+    $max=if ($times.Count) { $times[$times.Count-1] } else { $null }
+    @{runId=$runId;requestedSamples=$Samples;attempted=$rows.Count;validSamples=$valid.Count;repaired=$repaired.Count;invalidSamples=$rows.Count-$valid.Count;unrepaired=$valid.Count-$repaired.Count;observedP50Ms=$p50;observedP95Ms=$p95;observedMaxMs=$max;error=$failure;timing='Ledger occurred_at (before commit) to observed Redis convergence and APPLIED task. Includes polling and docker exec overhead; not exact commit-to-repair latency.';pollSleepMs=200;recoveryDelayMs=10000;providerDelayMs=6000;claim='Functional fault verification; small sample is not a resume performance benchmark.'} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir 'summary.json') -Encoding utf8
     Write-Host "Report: $reportDir"
 }
 
