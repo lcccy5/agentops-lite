@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -47,6 +48,7 @@ public final class ChatCompletionsGateway {
     private final Scheduler blockingScheduler;
     private final MeterRegistry meters;
     private final AtomicInteger activeConnections = new AtomicInteger();
+    private final AtomicInteger activeFinalizations = new AtomicInteger();
     private final CircuitBreaker providerCircuit;
 
     /** Creates the online gateway. */
@@ -56,6 +58,7 @@ public final class ChatCompletionsGateway {
         this.provider = providerWebClient; this.usage = usage; this.properties = properties; this.mapper = mapper;
         this.finalizer = blockingExecutor; this.blockingScheduler = blockingScheduler; this.meters = meters;
         meters.gauge("agentops.gateway.active_connections", activeConnections);
+        meters.gauge("agentops.gateway.active_finalizations", activeFinalizations);
         this.providerCircuit = circuitBreakers.circuitBreaker("provider");
     }
 
@@ -154,6 +157,8 @@ public final class ChatCompletionsGateway {
                                 ? zeroUsage() : usageAccumulator.usage(request);
                         finishAsync(reservation, confirmed, interrupted ? "CANCELLED" : "SETTLED", promptVersion, providerGenerationId.get());
                     }
+                    meters.timer("agentops.gateway.duration", "mode", "stream", "signal", signal.name())
+                            .record(Duration.ofNanos(System.nanoTime() - started.get()));
                 });
         return markProviderStarted(reservation).then(response.writeWith(body));
     }
@@ -170,7 +175,7 @@ public final class ChatCompletionsGateway {
     }
 
     private void finishAsync(Reservation reservation, ConfirmedUsage confirmed, String state, String promptVersion) {
-        finalizer.submit(() -> usage.finalizeReservation(reservation, confirmed, state, promptVersion));
+        submitFinalization(state, () -> usage.finalizeReservation(reservation, confirmed, state, promptVersion));
     }
 
     /** Persists a queryable provider ID outside the response subscription before asynchronous settlement. */
@@ -186,7 +191,32 @@ public final class ChatCompletionsGateway {
 
     /** Finalizes after persisting the ID observed on this response, preserving ordering across cancellation. */
     private void finishAsync(Reservation reservation, ConfirmedUsage confirmed, String state, String promptVersion, String providerGenerationId) {
-        finalizer.submit(() -> usage.finalizeReservation(reservation, confirmed, state, promptVersion, providerGenerationId));
+        submitFinalization(state, () -> usage.finalizeReservation(reservation, confirmed, state, promptVersion, providerGenerationId));
+    }
+
+    /** Measures the cancellation-safe handoff separately from the client response lifecycle. */
+    private void submitFinalization(String state, Runnable action) {
+        long terminalAt = System.nanoTime();
+        activeFinalizations.incrementAndGet();
+        try {
+            finalizer.submit(() -> {
+                meters.timer("agentops.gateway.finalization.queue", "state", state)
+                        .record(Duration.ofNanos(System.nanoTime() - terminalAt));
+                try {
+                    action.run();
+                    meters.counter("agentops.gateway.finalizations", "state", state, "outcome", "success").increment();
+                } catch (RuntimeException failure) {
+                    meters.counter("agentops.gateway.finalizations", "state", state, "outcome", "failure").increment();
+                } finally {
+                    activeFinalizations.updateAndGet(value -> Math.max(0, value - 1));
+                    meters.timer("agentops.gateway.terminal_to_finalized", "state", state)
+                            .record(Duration.ofNanos(System.nanoTime() - terminalAt));
+                }
+            });
+        } catch (RejectedExecutionException rejected) {
+            activeFinalizations.updateAndGet(value -> Math.max(0, value - 1));
+            meters.counter("agentops.gateway.finalizations", "state", state, "outcome", "rejected").increment();
+        }
     }
 
     private ConfirmedUsage usageFromJson(byte[] bytes, JsonNode request, boolean partial) {

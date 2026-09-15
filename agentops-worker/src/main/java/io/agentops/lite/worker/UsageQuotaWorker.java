@@ -1,8 +1,10 @@
 package io.agentops.lite.worker;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -13,6 +15,8 @@ import org.springframework.stereotype.Component;
 /** Replays durable MySQL quota operations into the disposable Redis online projection. */
 @Component
 public final class UsageQuotaWorker {
+    /** Bounds exclusive ownership before another worker may recover an abandoned task. */
+    private static final Duration LEASE_DURATION = Duration.ofSeconds(60);
     /** Finalizes held tokens after authoritative or estimated settlement. */
     private static final DefaultRedisScript<Long> FINALIZE = script("lua/finalize.lua");
     /** Releases only the connection slot while provider usage remains pending. */
@@ -26,21 +30,30 @@ public final class UsageQuotaWorker {
     /** Redis projection client used only after a task has been claimed. */
     private final StringRedisTemplate redis;
 
+    /** Stable process identity combined with a per-claim suffix for diagnostics and fencing. */
+    private final String workerId = UUID.randomUUID().toString();
     /** Creates the retry worker over the shared usage database and Redis instance. */
     public UsageQuotaWorker(JdbcTemplate jdbc, StringRedisTemplate redis) { this.jdbc = jdbc; this.redis = redis; }
 
     /** Applies due operations; Lua marker state makes retries safe after ambiguous network failures. */
     @Scheduled(fixedDelayString = "${agentops.worker.recovery-delay-ms:10000}")
     public void applyPendingQuotaTasks() {
-        for (Map<String, Object> task : jdbc.queryForList("select q.task_id,q.reservation_id,q.operation_id,q.action_type,q.token_value,r.project_id from usage_quota_task q join usage_reservation r on r.reservation_id=q.reservation_id where q.status='PENDING' and q.next_attempt_at<=? order by q.created_at limit 100", Instant.now())) {
-            if (jdbc.update("update usage_quota_task set status='PROCESSING',updated_at=? where task_id=? and status='PENDING'", Instant.now(), task.get("task_id")) != 1) continue;
+        Instant scanTime = Instant.now();
+        for (Map<String, Object> task : jdbc.queryForList("select q.task_id,q.reservation_id,q.operation_id,q.action_type,q.token_value,q.lease_version,r.project_id from usage_quota_task q join usage_reservation r on r.reservation_id=q.reservation_id where (q.status='PENDING' and q.next_attempt_at<=?) or (q.status='PROCESSING' and q.lease_until<=?) order by q.created_at limit 100", scanTime, scanTime)) {
+            long previousVersion = ((Number) task.get("lease_version")).longValue();
+            long leaseVersion = previousVersion + 1;
+            String leaseOwner = workerId + ":" + UUID.randomUUID();
+            Instant claimedAt = Instant.now();
+            if (jdbc.update("update usage_quota_task set status='PROCESSING',lease_owner=?,lease_until=?,lease_version=lease_version+1,updated_at=? where task_id=? and lease_version=? and ((status='PENDING' and next_attempt_at<=?) or (status='PROCESSING' and lease_until<=?))", leaseOwner, claimedAt.plus(LEASE_DURATION), claimedAt, task.get("task_id"), previousVersion, claimedAt, claimedAt) != 1) continue;
             try {
                 apply(task);
-                jdbc.update("update usage_quota_task set status='APPLIED',updated_at=? where task_id=? and status='PROCESSING'", Instant.now(), task.get("task_id"));
-                jdbc.update("update usage_reservation set quota_sync_status='APPLIED',updated_at=? where reservation_id=?", Instant.now(), task.get("reservation_id"));
+                Instant completedAt = Instant.now();
+                int completed = jdbc.update("update usage_quota_task set status='APPLIED',lease_owner=NULL,lease_until=NULL,updated_at=? where task_id=? and status='PROCESSING' and lease_owner=? and lease_version=?", completedAt, task.get("task_id"), leaseOwner, leaseVersion);
+                if (completed == 1) jdbc.update("update usage_reservation set quota_sync_status='APPLIED',updated_at=? where reservation_id=?", completedAt, task.get("reservation_id"));
             } catch (RuntimeException error) {
-                jdbc.update("update usage_quota_task set status='PENDING',attempts=attempts+1,next_attempt_at=?,last_error_code=?,updated_at=? where task_id=? and status='PROCESSING'", Instant.now().plusSeconds(5), safe(error), Instant.now(), task.get("task_id"));
-                jdbc.update("update usage_reservation set quota_sync_status='FAILED',updated_at=? where reservation_id=?", Instant.now(), task.get("reservation_id"));
+                Instant failedAt = Instant.now();
+                int retried = jdbc.update("update usage_quota_task set status='PENDING',attempts=attempts+1,next_attempt_at=?,last_error_code=?,lease_owner=NULL,lease_until=NULL,updated_at=? where task_id=? and status='PROCESSING' and lease_owner=? and lease_version=?", failedAt.plusSeconds(5), safe(error), failedAt, task.get("task_id"), leaseOwner, leaseVersion);
+                if (retried == 1) jdbc.update("update usage_reservation set quota_sync_status='FAILED',updated_at=? where reservation_id=?", failedAt, task.get("reservation_id"));
             }
         }
     }

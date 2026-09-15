@@ -1,5 +1,5 @@
 {
-  "priority": 1,
+  "priority": 10,
   "request": {"method":"POST","urlPath":"/v1/chat/completions","bodyPatterns":[{"matchesJsonPath":{"expression":"$.stream","equalTo":"true"}}]},
   "response": {"status":200,"headers":{"Content-Type":"text/event-stream"},"bodyFileName":"chat-stream.sse","chunkedDribbleDelay":{"numberOfChunks":4,"totalDuration":400}}
 }

@@ -4,7 +4,9 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $projectRoot
 try {
     # Use the caller's Java and the repository-local Maven settings so this works on any machine.
-    mvn -pl agentops-server -am spring-boot:run
+    mvn -pl agentops-server -am install -DskipTests
+    if ($LASTEXITCODE -ne 0) { throw "Server dependency build failed with exit code $LASTEXITCODE." }
+    mvn -pl agentops-server spring-boot:run
 } finally {
     Pop-Location
 }

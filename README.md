@@ -217,6 +217,14 @@ Docker 未运行时，集成测试会失败并提醒启动 Docker；这是为了
 .\scripts\run-gatling.ps1
 ```
 
+可量化的 SSE 生命周期基线使用参数化 Gatling 场景、快/慢 Mock Provider 和 Prometheus 自动验收：
+
+```powershell
+./scripts/run-sse-baseline.ps1 -CompleteUsers 10 -CancelUsers 10
+```
+
+指标口径与扩容注意事项见 [SSE 生命周期量化基线](docs/SSE-LOAD-BASELINE.md)。
+
 完整手工验收步骤见 [ACCEPTANCE.md](docs/ACCEPTANCE.md)。
 
 ## 主要管理接口
@@ -257,7 +265,7 @@ scripts                启动、演示、故障注入和验证脚本
 - Redis 成功后的崩溃可以从 `PENDING` Reservation 与长生命周期 Marker 判断是否需要补偿。
 - 原始 Ledger 不修改；估算用量修正通过追加 `USAGE_ADJUSTMENT` 完成。
 - Provider 可查询端点会保存 generation ID 并限期查询最终 usage；不支持查询的端点只按已捕获内容估算。详见 [双模式用量结算实施说明](docs/USAGE-SETTLEMENT-IMPLEMENTATION.md)。
-- Kafka 投影采用至少一次投递语义，通过 Ledger ID 保证业务幂等。
+- Kafka 投影采用至少一次投递语义，通过 Ledger ID 保证业务幂等；监听失败默认总计尝试 4 次，耗尽后写入同分区的 `<topic>.DLT`，只有死信发送确认后才跳过原消息。
 - WireMock 与 Toxiproxy 证明治理逻辑可以复现，不代表生产流量。
 - 确定性通道不等于真实模型质量提升。真实 Prompt 对比必须保存模型名、温度、时间和 24 条原始结果。
 - V0.1 提供轻量只读控制台和回滚操作，不包含 Kubernetes、商业计费、复杂动态路由、LLM-as-Judge 或自动回滚。

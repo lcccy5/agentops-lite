@@ -40,3 +40,8 @@ services:
     image: ghcr.io/shopify/toxiproxy:2.12.0
     ports: ["18474:8474", "18091:18091"]
     command: ["-host", "0.0.0.0"]
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    ports: ["19090:9090"]
+    volumes: ["./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    extra_hosts: ["host.docker.internal:host-gateway"]

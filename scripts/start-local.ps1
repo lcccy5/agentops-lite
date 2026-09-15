@@ -31,5 +31,7 @@ function Ensure-KafkaTopic([string]$Topic, [int]$RequiredPartitions) {
 docker compose up -d --wait
 Ensure-KafkaTopic 'agentops.usage.ledger.v1' 4
 Ensure-KafkaTopic 'agentops.eval.case.v1' 4
+Ensure-KafkaTopic 'agentops.usage.ledger.v1.DLT' 4
+Ensure-KafkaTopic 'agentops.eval.case.v1.DLT' 4
 docker compose ps
 Write-Host 'Infrastructure started. Run server and worker in separate terminals with scripts/run-server.ps1 and scripts/run-worker.ps1.'

@@ -16,6 +16,16 @@ spring:
 management:
   endpoints.web.exposure.include: health,info,prometheus,metrics
   endpoint.health.probes.enabled: true
+  metrics:
+    distribution:
+      percentiles-histogram:
+        agentops.gateway.first_token: true
+        agentops.gateway.duration: true
+        agentops.gateway.finalization.queue: true
+        agentops.gateway.terminal_to_finalized: true
+      slo:
+        agentops.gateway.first_token: 100ms,250ms,500ms,1s,2s
+        agentops.gateway.terminal_to_finalized: 50ms,100ms,250ms,500ms,1s,2s
 agentops:
   admin-token: ${AGENTOPS_ADMIN_TOKEN:local-admin-token}
   provider-base-url: ${PROVIDER_BASE_URL:http://localhost:18090}

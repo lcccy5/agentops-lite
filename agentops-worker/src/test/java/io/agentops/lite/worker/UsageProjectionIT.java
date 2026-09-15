@@ -14,18 +14,26 @@ import java.time.Duration;
 import java.time.Instant;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -39,7 +47,8 @@ import org.testcontainers.utility.DockerImageName;
 /** Verifies Kafka at-least-once delivery cannot double-apply an immutable ledger event. */
 @Testcontainers
 @SpringBootTest(classes = AgentOpsWorkerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.NONE, properties = {
-        "agentops.worker.relay-delay-ms=3600000", "agentops.worker.recovery-delay-ms=3600000"
+        "agentops.worker.relay-delay-ms=3600000", "agentops.worker.recovery-delay-ms=3600000",
+        "agentops.worker.kafka-retry-max-attempts=3", "agentops.worker.kafka-retry-backoff=10ms"
 })
 class UsageProjectionIT {
     @Container
@@ -187,6 +196,49 @@ class UsageProjectionIT {
                 eventCount, eventCount, eventCount * 40L);
     }
 
+    /** Routes a permanently invalid projection to the DLT instead of blocking its source partition forever. */
+    @Test
+    void routesPoisonUsageEventToDeadLetterTopicAfterFiniteRetries() throws Exception {
+        String ledgerId = UUID.randomUUID().toString();
+        String invalidProjectId = "x".repeat(65);
+        UsageLedgerEvent event = new UsageLedgerEvent(ledgerId, invalidProjectId, UUID.randomUUID().toString(),
+                "USAGE_ACTUAL", 40, BigDecimal.ZERO, "poison-test", Instant.now());
+        String payload = mapper.writeValueAsString(event);
+
+        kafka.send("agentops.usage.ledger.v1", ledgerId, payload).get();
+
+        Map<String, Object> consumerProperties = new HashMap<>();
+        consumerProperties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
+        consumerProperties.put(ConsumerConfig.GROUP_ID_CONFIG, "usage-dlt-verifier-" + UUID.randomUUID());
+        consumerProperties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        consumerProperties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        consumerProperties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+
+        ConsumerRecord<String, String> deadLetter = null;
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(consumerProperties)) {
+            consumer.subscribe(List.of("agentops.usage.ledger.v1.DLT"));
+            Instant deadline = Instant.now().plusSeconds(20);
+            while (deadLetter == null && Instant.now().isBefore(deadline)) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+                for (ConsumerRecord<String, String> record : records) {
+                    if (ledgerId.equals(record.key())) {
+                        deadLetter = record;
+                        break;
+                    }
+                }
+            }
+        }
+
+        assertThat(deadLetter).isNotNull();
+        assertThat(deadLetter.value()).isEqualTo(payload);
+        assertThat(deadLetter.headers().lastHeader(KafkaHeaders.DLT_EXCEPTION_FQCN)).isNotNull();
+        assertThat(deadLetter.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_TOPIC)).isNotNull();
+        assertThat(jdbc.queryForObject("select count(*) from usage_projection_applied where ledger_id=?", Integer.class, ledgerId))
+                .isZero();
+        assertThat(jdbc.queryForObject("select count(*) from usage_projection where project_id=?", Integer.class, invalidProjectId))
+                .isZero();
+    }
+
     /** Creates one immutable ledger fact and its matching PENDING Outbox row for retry testing. */
     private String insertPendingOutboxEvent(long tokens) throws Exception {
         String ledgerId = UUID.randomUUID().toString();
@@ -327,6 +379,45 @@ class UsageProjectionIT {
         System.out.printf("Missing provider ID result: reservedTokens=%d, settlement=PENDING, redisReserved=%d, redisActive=0%n",
                 reservedTokens, reservedTokens);
     }
+    /** Reclaims an expired quota lease and advances its fencing version exactly once. */
+    @Test
+    void reclaimsExpiredQuotaLeaseWithNewFence() {
+        String reservationId = UUID.randomUUID().toString();
+        String taskId = UUID.randomUUID().toString();
+        Instant now = Instant.now();
+        long reservedTokens = 200;
+        jdbc.update("""
+                insert into usage_reservation(reservation_id,request_id,correlation_id,project_id,idempotency_key,
+                    reserved_tokens,status,expires_at,created_at,updated_at)
+                values(?,?,?,?,?,?,'RESERVED',?,?,?)
+                """, reservationId, UUID.randomUUID().toString(), reservationId, "project-fund-agent",
+                "quota-lease-" + reservationId, reservedTokens, now.plusSeconds(30), now, now);
+        jdbc.update("""
+                insert into usage_quota_task(task_id,reservation_id,operation_id,action_type,token_value,status,
+                    next_attempt_at,lease_owner,lease_until,lease_version,created_at,updated_at)
+                values(?,?,?,?,?,'PROCESSING',?,?,?,?,?,?)
+                """, taskId, reservationId, UUID.randomUUID().toString(), "FINALIZE", 40,
+                now.minusSeconds(30), "stale-worker", now.minusSeconds(1), 7, now.minusSeconds(60), now.minusSeconds(60));
+        String quotaKey = "agentops:quota:project-fund-agent";
+        String reservationKey = "agentops:reservation:" + reservationId;
+        redis.opsForHash().put(quotaKey, "reserved", Long.toString(reservedTokens));
+        redis.opsForHash().put(quotaKey, "active", "1");
+        redis.opsForHash().put(quotaKey, "consumed", "0");
+        redis.opsForHash().put(reservationKey, "state", "RESERVED");
+        redis.opsForHash().put(reservationKey, "tokens", Long.toString(reservedTokens));
+
+        quotaWorker.applyPendingQuotaTasks();
+
+        var task = jdbc.queryForMap("select status,lease_owner,lease_until,lease_version from usage_quota_task where task_id=?", taskId);
+        assertThat(task.get("status")).isEqualTo("APPLIED");
+        assertThat(task.get("lease_owner")).isNull();
+        assertThat(task.get("lease_until")).isNull();
+        assertThat(((Number) task.get("lease_version")).longValue()).isEqualTo(8);
+        assertThat(redisCounter(quotaKey, "reserved")).isZero();
+        assertThat(redisCounter(quotaKey, "active")).isZero();
+        assertThat(redisCounter(quotaKey, "consumed")).isEqualTo(40);
+    }
+
     /** Reads a Redis quota field and treats a missing hash field as zero. */
     private long redisCounter(String key, String field) {
         Object value = redis.opsForHash().get(key, field);

@@ -72,8 +72,6 @@ public final class UsageWorker {
     @Scheduled(fixedDelayString = "${agentops.worker.recovery-delay-ms:10000}")
     public void reconcileUsage() {
         Instant now = Instant.now();
-        // PROCESSING quota tasks have no external lease; stale rows are safe to replay through idempotent Lua.
-        jdbc.update("update usage_quota_task set status='PENDING',next_attempt_at=?,updated_at=? where status='PROCESSING' and updated_at<?", now, now, now.minusSeconds(60));
 
         for (Map<String, Object> expired : jdbc.queryForList("""
                 select r.reservation_id,r.project_id,r.status,r.provider_started,r.reserved_tokens,
