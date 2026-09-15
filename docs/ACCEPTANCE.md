@@ -9,6 +9,7 @@
 7. 仅通过 Gate 的 Job 可以创建 5% Release；固定 subjectKey 重复解析必须命中同一版本；回滚后新解析不晚于 5 秒恢复稳定版本。
 8. `scripts/inject-provider-latency.ps1` 注入延迟，取消客户端后确认上游连接与许可不持续泄漏；最后运行 `scripts/clear-provider-faults.ps1`。
 9. `scripts/run-gatling.ps1` 执行 10 条完整 SSE 与 10 条主动取消连接；报告只描述为本机可复现负载。
+10. 向 `agentops.usage.ledger.v1` 投递永久无效的事件：有限重试耗尽后，原始 key、payload 与异常头必须出现在 `agentops.usage.ledger.v1.DLT`，对应 Projection 和幂等记录不得落库。
 
 真实模型验收必须另存模型名、温度、时间和 24 条原始结果；WireMock 自动化结果不得描述为真实 Prompt 质量提升。
 
