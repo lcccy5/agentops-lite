@@ -15,23 +15,33 @@ import org.springframework.web.reactive.function.client.WebClient;
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties(WorkerProperties.class)
 public class WorkerConfiguration {
-    /** Creates a neutral WebClient because the evaluation URL is fully configured. */
-    @Bean WebClient evaluationWebClient(WebClient.Builder builder) { return builder.build(); }
+  /** Creates a neutral WebClient because the evaluation URL is fully configured. */
+  @Bean
+  WebClient evaluationWebClient(WebClient.Builder builder) {
+    return builder.build();
+  }
 
-    /** Retries transient listener failures finitely and durably publishes poison records to a sibling DLT. */
-    @Bean
-    DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafka, WorkerProperties properties) {
-        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafka,
-                (record, error) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
-        // Never advance the source offset when the dead-letter publication itself was not acknowledged.
-        recoverer.setFailIfSendResultIsError(true);
+  /**
+   * Retries transient listener failures finitely and durably publishes poison records to a sibling
+   * DLT.
+   */
+  @Bean
+  DefaultErrorHandler kafkaErrorHandler(
+      KafkaTemplate<String, String> kafka, WorkerProperties properties) {
+    DeadLetterPublishingRecoverer recoverer =
+        new DeadLetterPublishingRecoverer(
+            kafka,
+            (record, error) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
+    // Never advance the source offset when the dead-letter publication itself was not acknowledged.
+    recoverer.setFailIfSendResultIsError(true);
 
-        long attempts = Math.max(1, properties.kafkaRetryMaxAttempts());
-        long backoffMillis = Math.max(0, properties.kafkaRetryBackoff().toMillis());
-        DefaultErrorHandler handler = new DefaultErrorHandler(recoverer,
-                new FixedBackOff(backoffMillis, attempts - 1));
-        // Malformed payloads and invalid domain arguments cannot become valid by waiting and retrying.
-        handler.addNotRetryableExceptions(JsonProcessingException.class, IllegalArgumentException.class);
-        return handler;
-    }
+    long attempts = Math.max(1, properties.kafkaRetryMaxAttempts());
+    long backoffMillis = Math.max(0, properties.kafkaRetryBackoff().toMillis());
+    DefaultErrorHandler handler =
+        new DefaultErrorHandler(recoverer, new FixedBackOff(backoffMillis, attempts - 1));
+    // Malformed payloads and invalid domain arguments cannot become valid by waiting and retrying.
+    handler.addNotRetryableExceptions(
+        JsonProcessingException.class, IllegalArgumentException.class);
+    return handler;
+  }
 }

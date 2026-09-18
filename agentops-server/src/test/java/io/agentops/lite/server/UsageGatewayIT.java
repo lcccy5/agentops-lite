@@ -47,324 +47,458 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * Verifies the online gateway against real MySQL and Redis boundaries.
- * A tiny JDK HTTP server controls only the external model response so persistence, Lua and cancellation remain real.
+ * Verifies the online gateway against real MySQL and Redis boundaries. A tiny JDK HTTP server
+ * controls only the external model response so persistence, Lua and cancellation remain real.
  */
 @Testcontainers
-@SpringBootTest(classes = AgentOpsServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+    classes = AgentOpsServerApplication.class,
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class UsageGatewayIT {
-    private static final String PROJECT_ID = "project-fund-agent";
-    private static final String ADMIN_TOKEN = "local-admin-token";
-    private static final String API_KEY = "agentops-dev-key";
+  private static final String PROJECT_ID = "project-fund-agent";
+  private static final String ADMIN_TOKEN = "local-admin-token";
+  private static final String API_KEY = "agentops-dev-key";
 
-    @Container
-    private static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4")
-            .withDatabaseName("agentops").withUsername("agentops").withPassword("agentops")
-            .withCommand("--log-bin-trust-function-creators=1");
+  @Container
+  private static final MySQLContainer<?> MYSQL =
+      new MySQLContainer<>("mysql:8.4")
+          .withDatabaseName("agentops")
+          .withUsername("agentops")
+          .withPassword("agentops")
+          .withCommand("--log-bin-trust-function-creators=1");
 
-    @Container
-    private static final GenericContainer<?> REDIS = new GenericContainer<>(DockerImageName.parse("redis:7.4-alpine"))
-            .withExposedPorts(6379);
+  @Container
+  private static final GenericContainer<?> REDIS =
+      new GenericContainer<>(DockerImageName.parse("redis:7.4-alpine")).withExposedPorts(6379);
 
-    private static final ExecutorService PROVIDER_EXECUTOR = Executors.newCachedThreadPool(runnable -> {
-        Thread thread = new Thread(runnable, "usage-gateway-it-provider");
-        thread.setDaemon(true);
-        return thread;
-    });
-    private static final HttpServer PROVIDER = startProvider();
-    private static volatile ProviderMode providerMode = ProviderMode.ORDINARY;
-    private static volatile String providerResponseBody = "{}";
+  private static final ExecutorService PROVIDER_EXECUTOR =
+      Executors.newCachedThreadPool(
+          runnable -> {
+            Thread thread = new Thread(runnable, "usage-gateway-it-provider");
+            thread.setDaemon(true);
+            return thread;
+          });
+  private static final HttpServer PROVIDER = startProvider();
+  private static volatile ProviderMode providerMode = ProviderMode.ORDINARY;
+  private static volatile String providerResponseBody = "{}";
 
-    private enum ProviderMode { ORDINARY, SLOW_STREAM }
+  private enum ProviderMode {
+    ORDINARY,
+    SLOW_STREAM
+  }
 
-    @DynamicPropertySource
-    static void registerInfrastructure(DynamicPropertyRegistry registry) {
-        registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
-        registry.add("spring.datasource.username", MYSQL::getUsername);
-        registry.add("spring.datasource.password", MYSQL::getPassword);
-        registry.add("spring.data.redis.host", REDIS::getHost);
-        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
-        registry.add("agentops.provider-base-url", UsageGatewayIT::providerBaseUrl);
-        registry.add("agentops.reservation-timeout", () -> "5s");
-    }
+  @DynamicPropertySource
+  static void registerInfrastructure(DynamicPropertyRegistry registry) {
+    registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
+    registry.add("spring.datasource.username", MYSQL::getUsername);
+    registry.add("spring.datasource.password", MYSQL::getPassword);
+    registry.add("spring.data.redis.host", REDIS::getHost);
+    registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+    registry.add("agentops.provider-base-url", UsageGatewayIT::providerBaseUrl);
+    registry.add("agentops.reservation-timeout", () -> "5s");
+  }
 
-    @LocalServerPort
-    private int port;
+  @LocalServerPort private int port;
 
-    @Autowired
-    private WebTestClient client;
+  @Autowired private WebTestClient client;
 
-    @Autowired
-    private JdbcTemplate jdbc;
+  @Autowired private JdbcTemplate jdbc;
 
-    @Autowired
-    private StringRedisTemplate redis;
+  @Autowired private StringRedisTemplate redis;
 
-    @Autowired
-    private ObjectMapper mapper;
+  @Autowired private ObjectMapper mapper;
 
-    @Autowired
-    private UsageService usageService;
+  @Autowired private UsageService usageService;
 
-    /** Resets mutable facts while preserving Flyway's local project and API-key seed. */
-    @BeforeEach
-    void resetMutableState() {
-        providerMode = ProviderMode.ORDINARY;
-        providerResponseBody = "{}";
-        // Routing reads the persisted endpoint; use this test's controlled provider.
-        jdbc.update("update provider_config set base_url=?,settlement_mode='ESTIMATE_FALLBACK',usage_query_path=null where project_id=?", providerBaseUrl(), PROJECT_ID);
-        jdbc.update("delete from usage_lookup_task");
-        jdbc.update("delete from usage_quota_task");
-        jdbc.update("delete from usage_provider_attempt");
-        jdbc.update("delete from usage_reconciliation");
-        jdbc.update("delete from usage_projection_applied");
-        jdbc.update("delete from usage_projection");
-        jdbc.update("delete from usage_outbox");
-        jdbc.update("delete from usage_ledger");
-        jdbc.update("delete from usage_reservation");
-        redis.getConnectionFactory().getConnection().serverCommands().flushDb();
-    }
+  /** Resets mutable facts while preserving Flyway's local project and API-key seed. */
+  @BeforeEach
+  void resetMutableState() {
+    providerMode = ProviderMode.ORDINARY;
+    providerResponseBody = "{}";
+    // Routing reads the persisted endpoint; use this test's controlled provider.
+    jdbc.update(
+        "update provider_config set"
+            + " base_url=?,settlement_mode='ESTIMATE_FALLBACK',usage_query_path=null where"
+            + " project_id=?",
+        providerBaseUrl(),
+        PROJECT_ID);
+    jdbc.update("delete from usage_lookup_task");
+    jdbc.update("delete from usage_quota_task");
+    jdbc.update("delete from usage_provider_attempt");
+    jdbc.update("delete from usage_reconciliation");
+    jdbc.update("delete from usage_projection_applied");
+    jdbc.update("delete from usage_projection");
+    jdbc.update("delete from usage_outbox");
+    jdbc.update("delete from usage_ledger");
+    jdbc.update("delete from usage_reservation");
+    redis.getConnectionFactory().getConnection().serverCommands().flushDb();
+  }
 
-    /** Stops the in-process provider after all Spring contexts release their clients. */
-    @AfterAll
-    static void stopProvider() {
-        PROVIDER.stop(0);
-        PROVIDER_EXECUTOR.shutdownNow();
-    }
+  /** Stops the in-process provider after all Spring contexts release their clients. */
+  @AfterAll
+  static void stopProvider() {
+    PROVIDER.stop(0);
+    PROVIDER_EXECUTOR.shutdownNow();
+  }
 
-    /** Proves provider usage becomes one immutable ledger entry and releases the Redis permit. */
-    @Test
-    void settlesProviderUsageWithoutLeakingQuota() {
-        stubOrdinaryUsage(28, 12);
+  /** Proves provider usage becomes one immutable ledger entry and releases the Redis permit. */
+  @Test
+  void settlesProviderUsageWithoutLeakingQuota() {
+    stubOrdinaryUsage(28, 12);
+    String requestId = UUID.randomUUID().toString();
+
+    sendOrdinary(requestId).expectStatus().isOk();
+
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () -> {
+              Map<String, Object> reservation = queryReservation(requestId);
+              assertThat(reservation.get("status")).isEqualTo("SETTLED");
+              assertThat(((Number) reservation.get("actual_tokens")).longValue()).isEqualTo(40);
+              assertThat(
+                      jdbc.queryForObject(
+                          "select count(*) from usage_ledger where reservation_id=?",
+                          Integer.class,
+                          reservation.get("reservation_id")))
+                  .isEqualTo(1);
+              assertThat(redisCounter("active")).isZero();
+              assertThat(redisCounter("reserved")).isZero();
+              assertThat(redisCounter("consumed")).isEqualTo(40);
+            });
+  }
+
+  /**
+   * Injects an Outbox insert failure and proves a MySQL transaction never leaves a lone ledger row
+   * behind.
+   */
+  @Test
+  void rollsBackLedgerAndOutboxTogetherWhenOutboxInsertFails() {
+    final int attempts = Integer.getInteger("billing.sample.count", 10);
+    jdbc.execute("drop trigger if exists usage_outbox_atomicity_fail");
+    jdbc.execute(
+        "create trigger usage_outbox_atomicity_fail before insert on usage_outbox for each row "
+            + "signal sqlstate '45000' set message_text = 'injected outbox failure'");
+    try {
+      for (int index = 0; index < attempts; index++) {
+        String reservationId = UUID.randomUUID().toString();
         String requestId = UUID.randomUUID().toString();
+        Instant now = Instant.now();
+        jdbc.update(
+"""
+insert into usage_reservation(reservation_id,request_id,correlation_id,project_id,idempotency_key,
+    reserved_tokens,status,expires_at,created_at,updated_at)
+values(?,?,?,?,?,?,'RESERVED',?,?,?)
+""",
+            reservationId,
+            requestId,
+            reservationId,
+            PROJECT_ID,
+            "atomicity-" + reservationId,
+            64,
+            now.plusSeconds(30),
+            now,
+            now);
+        Reservation reservation =
+            new Reservation(
+                reservationId,
+                requestId,
+                PROJECT_ID,
+                "atomicity-" + reservationId,
+                64,
+                ReservationStatus.RESERVED,
+                now.plusSeconds(30));
 
-        sendOrdinary(requestId).expectStatus().isOk();
+        assertThatThrownBy(
+                () ->
+                    usageService.finalizeReservation(
+                        reservation,
+                        new ConfirmedUsage(20, 10, false),
+                        "COMPLETED",
+                        "atomicity-test"))
+            .hasMessageContaining("injected outbox failure");
+      }
 
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            Map<String, Object> reservation = queryReservation(requestId);
-            assertThat(reservation.get("status")).isEqualTo("SETTLED");
-            assertThat(((Number) reservation.get("actual_tokens")).longValue()).isEqualTo(40);
-            assertThat(jdbc.queryForObject("select count(*) from usage_ledger where reservation_id=?", Integer.class,
-                    reservation.get("reservation_id"))).isEqualTo(1);
-            assertThat(redisCounter("active")).isZero();
-            assertThat(redisCounter("reserved")).isZero();
-            assertThat(redisCounter("consumed")).isEqualTo(40);
-        });
+      assertThat(jdbc.queryForObject("select count(*) from usage_ledger", Integer.class)).isZero();
+      assertThat(jdbc.queryForObject("select count(*) from usage_outbox", Integer.class)).isZero();
+      assertThat(jdbc.queryForObject("select count(*) from usage_quota_task", Integer.class))
+          .isZero();
+      assertThat(
+              jdbc.queryForObject(
+                  "select count(*) from usage_reservation where status='RESERVED'", Integer.class))
+          .isEqualTo(attempts);
+      System.out.printf(
+          "MySQL atomicity result: injectedOutboxFailures=%d, partialLedgers=0,"
+              + " partialOutboxRows=0%n",
+          attempts);
+    } finally {
+      jdbc.execute("drop trigger if exists usage_outbox_atomicity_fail");
     }
+  }
 
-    /** Injects an Outbox insert failure and proves a MySQL transaction never leaves a lone ledger row behind. */
-    @Test
-    void rollsBackLedgerAndOutboxTogetherWhenOutboxInsertFails() {
-        final int attempts = Integer.getInteger("billing.sample.count", 10);
-        jdbc.execute("drop trigger if exists usage_outbox_atomicity_fail");
-        jdbc.execute("create trigger usage_outbox_atomicity_fail before insert on usage_outbox for each row "
-                + "signal sqlstate '45000' set message_text = 'injected outbox failure'");
-        try {
-            for (int index = 0; index < attempts; index++) {
-                String reservationId = UUID.randomUUID().toString();
-                String requestId = UUID.randomUUID().toString();
-                Instant now = Instant.now();
-                jdbc.update("""
-                        insert into usage_reservation(reservation_id,request_id,correlation_id,project_id,idempotency_key,
-                            reserved_tokens,status,expires_at,created_at,updated_at)
-                        values(?,?,?,?,?,?,'RESERVED',?,?,?)
-                        """, reservationId, requestId, reservationId, PROJECT_ID, "atomicity-" + reservationId,
-                        64, now.plusSeconds(30), now, now);
-                Reservation reservation = new Reservation(reservationId, requestId, PROJECT_ID,
-                        "atomicity-" + reservationId, 64, ReservationStatus.RESERVED, now.plusSeconds(30));
+  /** Proves a repeated business key cannot create a second reservation, ledger or charge. */
+  @Test
+  void rejectsFinalizedIdempotencyKeyWithoutDoubleCharging() {
+    stubOrdinaryUsage(20, 10);
+    String requestId = UUID.randomUUID().toString();
+    sendOrdinary(requestId).expectStatus().isOk();
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () -> assertThat(queryReservation(requestId).get("status")).isEqualTo("SETTLED"));
 
-                assertThatThrownBy(() -> usageService.finalizeReservation(reservation,
-                        new ConfirmedUsage(20, 10, false), "COMPLETED", "atomicity-test"))
-                        .hasMessageContaining("injected outbox failure");
-            }
+    sendOrdinary(requestId).expectStatus().isEqualTo(409);
 
-            assertThat(jdbc.queryForObject("select count(*) from usage_ledger", Integer.class)).isZero();
-            assertThat(jdbc.queryForObject("select count(*) from usage_outbox", Integer.class)).isZero();
-            assertThat(jdbc.queryForObject("select count(*) from usage_quota_task", Integer.class)).isZero();
-            assertThat(jdbc.queryForObject("select count(*) from usage_reservation where status='RESERVED'", Integer.class))
-                    .isEqualTo(attempts);
-            System.out.printf("MySQL atomicity result: injectedOutboxFailures=%d, partialLedgers=0, partialOutboxRows=0%n", attempts);
-        } finally {
-            jdbc.execute("drop trigger if exists usage_outbox_atomicity_fail");
-        }
+    assertThat(
+            jdbc.queryForObject(
+                "select count(*) from usage_reservation where idempotency_key=?",
+                Integer.class,
+                requestId))
+        .isEqualTo(1);
+    assertThat(jdbc.queryForObject("select count(*) from usage_ledger", Integer.class))
+        .isEqualTo(1);
+    assertThat(redisCounter("consumed")).isEqualTo(30);
+  }
+
+  /** Starts two requests with one business key at the same time; only one may create a charge. */
+  @Test
+  void rejectsConcurrentIdempotencyRetryWithoutDoubleCharging() throws Exception {
+    stubOrdinaryUsage(20, 10);
+    String requestId = UUID.randomUUID().toString();
+    CountDownLatch clientsReady = new CountDownLatch(2);
+    CountDownLatch startTogether = new CountDownLatch(1);
+
+    CompletableFuture<Integer> first =
+        CompletableFuture.supplyAsync(
+            () -> sendConcurrentRequest(requestId, clientsReady, startTogether));
+    CompletableFuture<Integer> second =
+        CompletableFuture.supplyAsync(
+            () -> sendConcurrentRequest(requestId, clientsReady, startTogether));
+
+    assertThat(clientsReady.await(5, TimeUnit.SECONDS)).isTrue();
+    startTogether.countDown();
+    List<Integer> statuses =
+        List.of(first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
+
+    System.out.printf(
+        "Concurrent idempotency result: requestId=%s, HTTP statuses=%s%n", requestId, statuses);
+    assertThat(statuses).containsExactlyInAnyOrder(200, 409);
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () -> {
+              Map<String, Object> reservation = queryReservation(requestId);
+              assertThat(reservation.get("status")).isEqualTo("SETTLED");
+              assertThat(((Number) reservation.get("actual_tokens")).longValue()).isEqualTo(30);
+              assertThat(
+                      jdbc.queryForObject(
+                          "select count(*) from usage_reservation where idempotency_key=?",
+                          Integer.class,
+                          requestId))
+                  .isEqualTo(1);
+              assertThat(
+                      jdbc.queryForObject(
+                          "select count(*) from usage_ledger where reservation_id=?",
+                          Integer.class,
+                          reservation.get("reservation_id")))
+                  .isEqualTo(1);
+              assertThat(redisCounter("consumed")).isEqualTo(30);
+              assertThat(redisCounter("reserved")).isZero();
+              assertThat(redisCounter("active")).isZero();
+            });
+  }
+
+  /**
+   * Proves cancelling a partial SSE response still closes quota and persists an auditable estimate.
+   */
+  @Test
+  void cancelsPartialStreamWithoutLeakingQuota() {
+    providerMode = ProviderMode.SLOW_STREAM;
+    String requestId = UUID.randomUUID().toString();
+    JsonNode request =
+        mapper.valueToTree(
+            Map.of(
+                "model",
+                "deterministic-fund-model",
+                "stream",
+                true,
+                "max_tokens",
+                128,
+                "messages",
+                new Object[] {Map.of("role", "user", "content", "分析基金风险")}));
+
+    WebClient.create("http://localhost:" + port)
+        .post()
+        .uri("/v1/chat/completions")
+        .header(HttpHeaders.AUTHORIZATION, "Bearer " + API_KEY)
+        .header("Idempotency-Key", requestId)
+        .header("X-AgentOps-Request-Id", requestId)
+        .contentType(MediaType.APPLICATION_JSON)
+        .bodyValue(request)
+        .retrieve()
+        .bodyToFlux(String.class)
+        .take(1)
+        .blockLast(Duration.ofSeconds(10));
+
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .untilAsserted(
+            () -> {
+              Map<String, Object> reservation = queryReservation(requestId);
+              assertThat(reservation.get("status")).isIn("CANCELLED", "RECONCILIATION_PENDING");
+              assertThat(redisCounter("active")).isZero();
+              assertThat(redisCounter("reserved")).isZero();
+              assertThat(jdbc.queryForObject("select count(*) from usage_ledger", Integer.class))
+                  .isEqualTo(1);
+            });
+  }
+
+  /** Configures one deterministic non-streaming provider response with authoritative usage. */
+  private void stubOrdinaryUsage(long inputTokens, long outputTokens) {
+    providerMode = ProviderMode.ORDINARY;
+    // A literal response keeps the provider contract visible in the failure report.
+    providerResponseBody =
+        "{\"id\":\"chatcmpl-it\",\"choices\":[{\"message\":{\"content\":\"ok\"}}],"
+            + "\"usage\":{\"prompt_tokens\":"
+            + inputTokens
+            + ",\"completion_tokens\":"
+            + outputTokens
+            + "}}";
+  }
+
+  /** Sends a deterministic request whose request ID also serves as the idempotency key. */
+  private WebTestClient.ResponseSpec sendOrdinary(String requestId) {
+    return client
+        .post()
+        .uri("/v1/chat/completions")
+        .header(HttpHeaders.AUTHORIZATION, "Bearer " + API_KEY)
+        .header("Idempotency-Key", requestId)
+        .header("X-AgentOps-Request-Id", requestId)
+        .contentType(MediaType.APPLICATION_JSON)
+        .bodyValue(
+            Map.of(
+                "model",
+                "deterministic-fund-model",
+                "stream",
+                false,
+                "max_tokens",
+                128,
+                "messages",
+                new Object[] {Map.of("role", "user", "content", "分析基金风险")}))
+        .exchange();
+  }
+
+  /** Coordinates one real HTTP client with its peer, then returns 409 as a normal test result. */
+  private int sendConcurrentRequest(
+      String requestId, CountDownLatch clientsReady, CountDownLatch startTogether) {
+    clientsReady.countDown();
+    try {
+      if (!startTogether.await(5, TimeUnit.SECONDS))
+        throw new IllegalStateException("Concurrent start was not released");
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Concurrent client was interrupted", exception);
     }
-    /** Proves a repeated business key cannot create a second reservation, ledger or charge. */
-    @Test
-    void rejectsFinalizedIdempotencyKeyWithoutDoubleCharging() {
-        stubOrdinaryUsage(20, 10);
-        String requestId = UUID.randomUUID().toString();
-        sendOrdinary(requestId).expectStatus().isOk();
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                assertThat(queryReservation(requestId).get("status")).isEqualTo("SETTLED"));
+    return WebClient.create("http://localhost:" + port)
+        .post()
+        .uri("/v1/chat/completions")
+        .header(HttpHeaders.AUTHORIZATION, "Bearer " + API_KEY)
+        .header("Idempotency-Key", requestId)
+        .header("X-AgentOps-Request-Id", requestId)
+        .contentType(MediaType.APPLICATION_JSON)
+        .bodyValue(
+            Map.of(
+                "model",
+                "deterministic-fund-model",
+                "stream",
+                false,
+                "max_tokens",
+                128,
+                "messages",
+                new Object[] {Map.of("role", "user", "content", "并发幂等测试")}))
+        .exchangeToMono(
+            response -> response.bodyToMono(Void.class).thenReturn(response.statusCode().value()))
+        .block(Duration.ofSeconds(10));
+  }
 
-        sendOrdinary(requestId).expectStatus().isEqualTo(409);
+  /** Returns the persisted reservation using the public diagnostic contract. */
+  private Map<String, Object> queryReservation(String requestId) {
+    return client
+        .get()
+        .uri("/internal/v1/usage/queryRequest/{requestId}", requestId)
+        .header("X-AgentOps-Admin-Token", ADMIN_TOKEN)
+        .exchange()
+        .expectStatus()
+        .isOk()
+        .expectBody(
+            new org.springframework.core.ParameterizedTypeReference<Map<String, Object>>() {})
+        .returnResult()
+        .getResponseBody();
+  }
 
-        assertThat(jdbc.queryForObject("select count(*) from usage_reservation where idempotency_key=?", Integer.class, requestId)).isEqualTo(1);
-        assertThat(jdbc.queryForObject("select count(*) from usage_ledger", Integer.class)).isEqualTo(1);
-        assertThat(redisCounter("consumed")).isEqualTo(30);
+  /** Reads one Redis quota counter and treats an absent counter as zero. */
+  private long redisCounter(String field) {
+    Object value = redis.opsForHash().get("agentops:quota:" + PROJECT_ID, field);
+    return value == null ? 0 : Long.parseLong(value.toString());
+  }
+
+  /** Starts a dependency-free provider double before Spring resolves dynamic properties. */
+  private static HttpServer startProvider() {
+    try {
+      HttpServer server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+      server.createContext("/v1/chat/completions", UsageGatewayIT::handleProviderRequest);
+      server.setExecutor(PROVIDER_EXECUTOR);
+      server.start();
+      return server;
+    } catch (IOException exception) {
+      throw new IllegalStateException("Cannot start the integration-test provider", exception);
     }
+  }
 
-    /** Starts two requests with one business key at the same time; only one may create a charge. */
-    @Test
-    void rejectsConcurrentIdempotencyRetryWithoutDoubleCharging() throws Exception {
-        stubOrdinaryUsage(20, 10);
-        String requestId = UUID.randomUUID().toString();
-        CountDownLatch clientsReady = new CountDownLatch(2);
-        CountDownLatch startTogether = new CountDownLatch(1);
+  /** Returns the OpenAI-compatible base URL exposed by the in-process provider double. */
+  private static String providerBaseUrl() {
+    return "http://localhost:" + PROVIDER.getAddress().getPort();
+  }
 
-        CompletableFuture<Integer> first = CompletableFuture.supplyAsync(
-                () -> sendConcurrentRequest(requestId, clientsReady, startTogether));
-        CompletableFuture<Integer> second = CompletableFuture.supplyAsync(
-                () -> sendConcurrentRequest(requestId, clientsReady, startTogether));
-
-        assertThat(clientsReady.await(5, TimeUnit.SECONDS)).isTrue();
-        startTogether.countDown();
-        List<Integer> statuses = List.of(first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
-
-        System.out.printf("Concurrent idempotency result: requestId=%s, HTTP statuses=%s%n", requestId, statuses);
-        assertThat(statuses).containsExactlyInAnyOrder(200, 409);
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            Map<String, Object> reservation = queryReservation(requestId);
-            assertThat(reservation.get("status")).isEqualTo("SETTLED");
-            assertThat(((Number) reservation.get("actual_tokens")).longValue()).isEqualTo(30);
-            assertThat(jdbc.queryForObject("select count(*) from usage_reservation where idempotency_key=?", Integer.class,
-                    requestId)).isEqualTo(1);
-            assertThat(jdbc.queryForObject("select count(*) from usage_ledger where reservation_id=?", Integer.class,
-                    reservation.get("reservation_id"))).isEqualTo(1);
-            assertThat(redisCounter("consumed")).isEqualTo(30);
-            assertThat(redisCounter("reserved")).isZero();
-            assertThat(redisCounter("active")).isZero();
-        });
+  /** Routes each model request to the ordinary or deliberately slow streaming fixture. */
+  private static void handleProviderRequest(HttpExchange exchange) throws IOException {
+    try (exchange) {
+      exchange.getRequestBody().readAllBytes();
+      if (!"POST".equals(exchange.getRequestMethod())) {
+        exchange.sendResponseHeaders(405, -1);
+        return;
+      }
+      if (providerMode == ProviderMode.SLOW_STREAM) {
+        writeSlowStream(exchange);
+        return;
+      }
+      byte[] body = providerResponseBody.getBytes(StandardCharsets.UTF_8);
+      exchange.getResponseHeaders().set(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE);
+      exchange.sendResponseHeaders(200, body.length);
+      exchange.getResponseBody().write(body);
     }
-    /** Proves cancelling a partial SSE response still closes quota and persists an auditable estimate. */
-    @Test
-    void cancelsPartialStreamWithoutLeakingQuota() {
-        providerMode = ProviderMode.SLOW_STREAM;
-        String requestId = UUID.randomUUID().toString();
-        JsonNode request = mapper.valueToTree(Map.of("model", "deterministic-fund-model", "stream", true,
-                "max_tokens", 128, "messages", new Object[]{Map.of("role", "user", "content", "分析基金风险")}));
+  }
 
-        WebClient.create("http://localhost:" + port).post().uri("/v1/chat/completions")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + API_KEY)
-                .header("Idempotency-Key", requestId).header("X-AgentOps-Request-Id", requestId)
-                .contentType(MediaType.APPLICATION_JSON).bodyValue(request).retrieve()
-                .bodyToFlux(String.class).take(1).blockLast(Duration.ofSeconds(10));
-
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            Map<String, Object> reservation = queryReservation(requestId);
-            assertThat(reservation.get("status")).isIn("CANCELLED", "RECONCILIATION_PENDING");
-            assertThat(redisCounter("active")).isZero();
-            assertThat(redisCounter("reserved")).isZero();
-            assertThat(jdbc.queryForObject("select count(*) from usage_ledger", Integer.class)).isEqualTo(1);
-        });
+  /** Flushes one SSE event before delaying the remainder so the client can cancel mid-stream. */
+  private static void writeSlowStream(HttpExchange exchange) throws IOException {
+    exchange.getResponseHeaders().set(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE);
+    exchange.sendResponseHeaders(200, 0);
+    try (OutputStream output = exchange.getResponseBody()) {
+      output.write(
+          "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+              .getBytes(StandardCharsets.UTF_8));
+      output.flush();
+      try {
+        Thread.sleep(3000);
+      } catch (InterruptedException exception) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+      output.write(
+          ("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n" + "data: [DONE]\n\n")
+              .getBytes(StandardCharsets.UTF_8));
+    } catch (IOException ignored) {
+      // A closed socket is expected after the gateway cancels the upstream response.
     }
-
-    /** Configures one deterministic non-streaming provider response with authoritative usage. */
-    private void stubOrdinaryUsage(long inputTokens, long outputTokens) {
-        providerMode = ProviderMode.ORDINARY;
-        // A literal response keeps the provider contract visible in the failure report.
-        providerResponseBody = "{\"id\":\"chatcmpl-it\",\"choices\":[{\"message\":{\"content\":\"ok\"}}],"
-                + "\"usage\":{\"prompt_tokens\":" + inputTokens
-                + ",\"completion_tokens\":" + outputTokens + "}}";
-    }
-
-    /** Sends a deterministic request whose request ID also serves as the idempotency key. */
-    private WebTestClient.ResponseSpec sendOrdinary(String requestId) {
-        return client.post().uri("/v1/chat/completions")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + API_KEY)
-                .header("Idempotency-Key", requestId).header("X-AgentOps-Request-Id", requestId)
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("model", "deterministic-fund-model", "stream", false, "max_tokens", 128,
-                        "messages", new Object[]{Map.of("role", "user", "content", "分析基金风险")}))
-                .exchange();
-    }
-
-    /** Coordinates one real HTTP client with its peer, then returns 409 as a normal test result. */
-    private int sendConcurrentRequest(String requestId, CountDownLatch clientsReady, CountDownLatch startTogether) {
-        clientsReady.countDown();
-        try {
-            if (!startTogether.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Concurrent start was not released");
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Concurrent client was interrupted", exception);
-        }
-        return WebClient.create("http://localhost:" + port).post().uri("/v1/chat/completions")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + API_KEY)
-                .header("Idempotency-Key", requestId).header("X-AgentOps-Request-Id", requestId)
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("model", "deterministic-fund-model", "stream", false, "max_tokens", 128,
-                        "messages", new Object[]{Map.of("role", "user", "content", "并发幂等测试")}))
-                .exchangeToMono(response -> response.bodyToMono(Void.class).thenReturn(response.statusCode().value()))
-                .block(Duration.ofSeconds(10));
-    }
-    /** Returns the persisted reservation using the public diagnostic contract. */
-    private Map<String, Object> queryReservation(String requestId) {
-        return client.get().uri("/internal/v1/usage/queryRequest/{requestId}", requestId)
-                .header("X-AgentOps-Admin-Token", ADMIN_TOKEN).exchange().expectStatus().isOk()
-                .expectBody(new org.springframework.core.ParameterizedTypeReference<Map<String, Object>>() { }).returnResult().getResponseBody();
-    }
-
-    /** Reads one Redis quota counter and treats an absent counter as zero. */
-    private long redisCounter(String field) {
-        Object value = redis.opsForHash().get("agentops:quota:" + PROJECT_ID, field);
-        return value == null ? 0 : Long.parseLong(value.toString());
-    }
-
-    /** Starts a dependency-free provider double before Spring resolves dynamic properties. */
-    private static HttpServer startProvider() {
-        try {
-            HttpServer server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
-            server.createContext("/v1/chat/completions", UsageGatewayIT::handleProviderRequest);
-            server.setExecutor(PROVIDER_EXECUTOR);
-            server.start();
-            return server;
-        } catch (IOException exception) {
-            throw new IllegalStateException("Cannot start the integration-test provider", exception);
-        }
-    }
-
-    /** Returns the OpenAI-compatible base URL exposed by the in-process provider double. */
-    private static String providerBaseUrl() {
-        return "http://localhost:" + PROVIDER.getAddress().getPort();
-    }
-
-    /** Routes each model request to the ordinary or deliberately slow streaming fixture. */
-    private static void handleProviderRequest(HttpExchange exchange) throws IOException {
-        try (exchange) {
-            exchange.getRequestBody().readAllBytes();
-            if (!"POST".equals(exchange.getRequestMethod())) {
-                exchange.sendResponseHeaders(405, -1);
-                return;
-            }
-            if (providerMode == ProviderMode.SLOW_STREAM) {
-                writeSlowStream(exchange);
-                return;
-            }
-            byte[] body = providerResponseBody.getBytes(StandardCharsets.UTF_8);
-            exchange.getResponseHeaders().set(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE);
-            exchange.sendResponseHeaders(200, body.length);
-            exchange.getResponseBody().write(body);
-        }
-    }
-
-    /** Flushes one SSE event before delaying the remainder so the client can cancel mid-stream. */
-    private static void writeSlowStream(HttpExchange exchange) throws IOException {
-        exchange.getResponseHeaders().set(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE);
-        exchange.sendResponseHeaders(200, 0);
-        try (OutputStream output = exchange.getResponseBody()) {
-            output.write("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
-                    .getBytes(StandardCharsets.UTF_8));
-            output.flush();
-            try {
-                Thread.sleep(3000);
-            } catch (InterruptedException exception) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-            output.write(("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n"
-                    + "data: [DONE]\n\n").getBytes(StandardCharsets.UTF_8));
-        } catch (IOException ignored) {
-            // A closed socket is expected after the gateway cancels the upstream response.
-        }
-    }
+  }
 }

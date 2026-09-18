@@ -6,9 +6,9 @@ import io.agentops.lite.core.domain.UsageModels.ConfirmedUsage;
 import io.agentops.lite.core.domain.UsageModels.Reservation;
 import io.agentops.lite.server.config.AgentOpsProperties;
 import io.agentops.lite.server.usage.UsageService;
-import io.micrometer.core.instrument.MeterRegistry;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -16,8 +16,8 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpHeaders;
@@ -34,268 +34,469 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
 import reactor.core.scheduler.Scheduler;
-import reactor.util.concurrent.Queues;
 
-/** OpenAI-compatible online entry with admission, transparent SSE and cancellation-safe accounting. */
+/**
+ * OpenAI-compatible online entry with admission, transparent SSE and cancellation-safe accounting.
+ */
 @RestController
 public final class ChatCompletionsGateway {
-    private static final int MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
-    private final WebClient provider;
-    private final UsageService usage;
-    private final AgentOpsProperties properties;
-    private final ObjectMapper mapper;
-    private final ExecutorService finalizer;
-    private final Scheduler blockingScheduler;
-    private final MeterRegistry meters;
-    private final AtomicInteger activeConnections = new AtomicInteger();
-    private final AtomicInteger activeFinalizations = new AtomicInteger();
-    private final CircuitBreaker providerCircuit;
+  private static final int MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
+  private final WebClient provider;
+  private final UsageService usage;
+  private final AgentOpsProperties properties;
+  private final ObjectMapper mapper;
+  private final ExecutorService finalizer;
+  private final Scheduler blockingScheduler;
+  private final MeterRegistry meters;
+  private final AtomicInteger activeConnections = new AtomicInteger();
+  private final AtomicInteger activeFinalizations = new AtomicInteger();
+  private final CircuitBreaker providerCircuit;
 
-    /** Creates the online gateway. */
-    public ChatCompletionsGateway(WebClient providerWebClient, UsageService usage, AgentOpsProperties properties,
-                                  ObjectMapper mapper, ExecutorService blockingExecutor,
-                                  Scheduler blockingScheduler, MeterRegistry meters, CircuitBreakerRegistry circuitBreakers) {
-        this.provider = providerWebClient; this.usage = usage; this.properties = properties; this.mapper = mapper;
-        this.finalizer = blockingExecutor; this.blockingScheduler = blockingScheduler; this.meters = meters;
-        meters.gauge("agentops.gateway.active_connections", activeConnections);
-        meters.gauge("agentops.gateway.active_finalizations", activeFinalizations);
-        this.providerCircuit = circuitBreakers.circuitBreaker("provider");
+  /** Creates the online gateway. */
+  public ChatCompletionsGateway(
+      WebClient providerWebClient,
+      UsageService usage,
+      AgentOpsProperties properties,
+      ObjectMapper mapper,
+      ExecutorService blockingExecutor,
+      Scheduler blockingScheduler,
+      MeterRegistry meters,
+      CircuitBreakerRegistry circuitBreakers) {
+    this.provider = providerWebClient;
+    this.usage = usage;
+    this.properties = properties;
+    this.mapper = mapper;
+    this.finalizer = blockingExecutor;
+    this.blockingScheduler = blockingScheduler;
+    this.meters = meters;
+    meters.gauge("agentops.gateway.active_connections", activeConnections);
+    meters.gauge("agentops.gateway.active_finalizations", activeFinalizations);
+    this.providerCircuit = circuitBreakers.circuitBreaker("provider");
+  }
+
+  /** Proxies the exact compatibility route required by Spring AI clients. */
+  @PostMapping(path = "/v1/chat/completions", consumes = MediaType.APPLICATION_JSON_VALUE)
+  public Mono<Void> createChatCompletion(
+      @RequestBody JsonNode request, ServerWebExchange exchange) {
+    RequestMetadata metadata = requestMetadata(exchange);
+    return Mono.fromCallable(
+            () -> {
+              Reservation reservation =
+                  usage.reserve(
+                      metadata.projectId(),
+                      metadata.requestId(),
+                      metadata.correlationId(),
+                      metadata.idempotencyKey(),
+                      request);
+              return new ProviderCall(reservation, usage.providerBaseUrl(metadata.projectId()));
+            })
+        .subscribeOn(blockingScheduler)
+        .flatMap(
+            call ->
+                request.path("stream").asBoolean(false)
+                    ? stream(request, exchange.getResponse(), call, metadata)
+                    : ordinary(request, exchange.getResponse(), call, metadata));
+  }
+
+  private RequestMetadata requestMetadata(ServerWebExchange exchange) {
+    HttpHeaders headers = exchange.getRequest().getHeaders();
+    String requestId =
+        first(headers.getFirst("X-AgentOps-Request-Id"), UUID.randomUUID().toString());
+    return new RequestMetadata(
+        exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE),
+        requestId,
+        first(headers.getFirst("X-AgentOps-Correlation-Id"), requestId),
+        first(headers.getFirst("Idempotency-Key"), requestId),
+        headers.getFirst("Prompt-Version"),
+        headers.getFirst("Release-Id"),
+        headers.getFirst("Variant"));
+  }
+
+  private Mono<Void> ordinary(
+      JsonNode request, ServerHttpResponse response, ProviderCall call, RequestMetadata metadata) {
+    Reservation reservation = call.reservation();
+    long started = System.nanoTime();
+    AtomicReference<String> generationId = new AtomicReference<>();
+    if (!providerCircuit.tryAcquirePermission()) {
+      finishAsync(reservation, zeroUsage(), "FAILED", metadata.promptVersion());
+      return Mono.error(
+          new GatewayException(
+              "PROVIDER_CIRCUIT_OPEN", HttpStatus.SERVICE_UNAVAILABLE, "Provider circuit is open"));
     }
+    return markProviderStarted(reservation)
+        .then(
+            provider
+                .post()
+                .uri(completionUri(call.baseUrl()))
+                .headers(headers -> upstreamHeaders(headers, reservation, metadata))
+                .bodyValue(request)
+                .exchangeToMono(upstream -> readOrdinary(upstream, response))
+                .flatMap(
+                    bytes -> {
+                      generationId.set(providerGenerationId(bytes));
+                      ConfirmedUsage confirmed = usageFromJson(bytes, request, false);
+                      persistGenerationIdAsync(reservation, generationId.get());
+                      finishAsync(
+                          reservation,
+                          confirmed,
+                          "SETTLED",
+                          metadata.promptVersion(),
+                          generationId.get());
+                      response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+                      return response.writeWith(Mono.just(response.bufferFactory().wrap(bytes)));
+                    }))
+        .doOnSuccess(
+            ignored ->
+                providerCircuit.onSuccess(
+                    System.nanoTime() - started, java.util.concurrent.TimeUnit.NANOSECONDS))
+        .doOnError(
+            error -> {
+              providerCircuit.onError(
+                  System.nanoTime() - started, java.util.concurrent.TimeUnit.NANOSECONDS, error);
+              finishAsync(
+                  reservation, failureUsage(request, error), "FAILED", metadata.promptVersion());
+            })
+        .doFinally(
+            signal ->
+                meters
+                    .timer("agentops.gateway.duration", "mode", "ordinary", "signal", signal.name())
+                    .record(Duration.ofNanos(System.nanoTime() - started)));
+  }
 
-    /** Proxies the exact compatibility route required by Spring AI clients. */
-    @PostMapping(path = "/v1/chat/completions", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<Void> createChatCompletion(@RequestBody JsonNode request, ServerWebExchange exchange) {
-        String projectId = exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE);
-        String requestId = first(exchange.getRequest().getHeaders().getFirst("X-AgentOps-Request-Id"), UUID.randomUUID().toString());
-        String correlationId = first(exchange.getRequest().getHeaders().getFirst("X-AgentOps-Correlation-Id"), requestId);
-        String idempotencyKey = first(exchange.getRequest().getHeaders().getFirst("Idempotency-Key"), requestId);
-        String promptVersion = exchange.getRequest().getHeaders().getFirst("Prompt-Version");
-        String releaseId = exchange.getRequest().getHeaders().getFirst("Release-Id");
-        String variant = exchange.getRequest().getHeaders().getFirst("Variant");
-        return Mono.fromCallable(() -> {
-                    Reservation reservation = usage.reserve(projectId, requestId, correlationId, idempotencyKey, request);
-                    return new ProviderCall(reservation, usage.providerBaseUrl(projectId));
-                }).subscribeOn(blockingScheduler)
-                .flatMap(call -> request.path("stream").asBoolean(false)
-                        ? stream(request, exchange.getResponse(), call.reservation(), call.baseUrl(), promptVersion, releaseId, variant)
-                        : ordinary(request, exchange.getResponse(), call.reservation(), call.baseUrl(), promptVersion, releaseId, variant));
+  private Mono<byte[]> readOrdinary(ClientResponse upstream, ServerHttpResponse downstream) {
+    downstream.setStatusCode(upstream.statusCode());
+    if (upstream.statusCode().isError())
+      return upstream
+          .bodyToMono(byte[].class)
+          .flatMap(
+              bytes ->
+                  Mono.error(
+                      new GatewayException(
+                          "PROVIDER_" + upstream.statusCode().value(),
+                          mapStatus(upstream.statusCode().value()),
+                          safeProviderMessage(bytes))));
+    return upstream.bodyToMono(byte[].class);
+  }
+
+  private Mono<Void> stream(
+      JsonNode request, ServerHttpResponse response, ProviderCall call, RequestMetadata metadata) {
+    Reservation reservation = call.reservation();
+    ByteArrayOutputStream capture = new ByteArrayOutputStream();
+    AtomicBoolean finalized = new AtomicBoolean();
+    AtomicBoolean firstToken = new AtomicBoolean();
+    AtomicLong started = new AtomicLong(System.nanoTime());
+    AtomicReference<Throwable> streamFailure = new AtomicReference<>();
+    ProviderUsageAccumulator usageAccumulator = new ProviderUsageAccumulator(mapper);
+    AtomicReference<String> providerGenerationId = new AtomicReference<>();
+    if (!providerCircuit.tryAcquirePermission()) {
+      finishAsync(reservation, zeroUsage(), "FAILED", metadata.promptVersion());
+      return Mono.error(
+          new GatewayException(
+              "PROVIDER_CIRCUIT_OPEN", HttpStatus.SERVICE_UNAVAILABLE, "Provider circuit is open"));
     }
-
-    private Mono<Void> ordinary(JsonNode request, ServerHttpResponse response, Reservation reservation, String providerBaseUrl,
-                                String promptVersion, String releaseId, String variant) {
-        long started = System.nanoTime();
-        AtomicReference<String> generationId = new AtomicReference<>();
-        if (!providerCircuit.tryAcquirePermission()) {
-            finishAsync(reservation, zeroUsage(), "FAILED", promptVersion);
-            return Mono.error(new GatewayException("PROVIDER_CIRCUIT_OPEN", HttpStatus.SERVICE_UNAVAILABLE, "Provider circuit is open"));
-        }
-        return markProviderStarted(reservation).then(provider.post().uri(completionUri(providerBaseUrl)).headers(headers -> upstreamHeaders(headers, reservation, promptVersion, releaseId, variant))
-                .bodyValue(request).exchangeToMono(upstream -> readOrdinary(upstream, response))
-                .flatMap(bytes -> {
-                    generationId.set(providerGenerationId(bytes));
-                    ConfirmedUsage confirmed = usageFromJson(bytes, request, false);
-                    persistGenerationIdAsync(reservation, generationId.get());
-                    finishAsync(reservation, confirmed, "SETTLED", promptVersion, generationId.get());
-                    response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-                    return response.writeWith(Mono.just(response.bufferFactory().wrap(bytes)));
+    response.setStatusCode(HttpStatus.OK);
+    response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
+    Flux<DataBuffer> body =
+        provider
+            .post()
+            .uri(completionUri(call.baseUrl()))
+            .headers(headers -> upstreamHeaders(headers, reservation, metadata))
+            .bodyValue(request)
+            .exchangeToFlux(upstream -> readStream(upstream))
+            .doOnNext(
+                bytes -> {
+                  if (firstToken.compareAndSet(false, true))
+                    meters
+                        .timer("agentops.gateway.first_token")
+                        .record(Duration.ofNanos(System.nanoTime() - started.get()));
+                  usageAccumulator.accept(bytes);
+                  String observedId = usageAccumulator.generationId();
+                  if (observedId != null
+                      && !observedId.equals(providerGenerationId.getAndSet(observedId))) {
+                    persistGenerationIdAsync(reservation, observedId);
+                  }
+                  if (capture.size() + bytes.length <= MAX_CAPTURE_BYTES) capture.writeBytes(bytes);
                 })
-        )
-                .doOnSuccess(ignored -> providerCircuit.onSuccess(System.nanoTime() - started, java.util.concurrent.TimeUnit.NANOSECONDS))
-                .doOnError(error -> {
-                    providerCircuit.onError(System.nanoTime() - started, java.util.concurrent.TimeUnit.NANOSECONDS, error);
-                    finishAsync(reservation, failureUsage(request, error), "FAILED", promptVersion);
+            .onBackpressureBuffer(
+                Math.max(8, properties.streamBufferSize()),
+                ignored -> meters.counter("agentops.gateway.buffer_overflow").increment(),
+                reactor.core.publisher.BufferOverflowStrategy.ERROR)
+            .map(bytes -> response.bufferFactory().wrap(bytes))
+            .doOnComplete(
+                () ->
+                    providerCircuit.onSuccess(
+                        System.nanoTime() - started.get(),
+                        java.util.concurrent.TimeUnit.NANOSECONDS))
+            .doOnError(
+                error -> {
+                  streamFailure.set(error);
+                  providerCircuit.onError(
+                      System.nanoTime() - started.get(),
+                      java.util.concurrent.TimeUnit.NANOSECONDS,
+                      error);
                 })
-                .doFinally(signal -> meters.timer("agentops.gateway.duration", "mode", "ordinary", "signal", signal.name())
-                        .record(Duration.ofNanos(System.nanoTime() - started)));
-    }
-
-    private Mono<byte[]> readOrdinary(ClientResponse upstream, ServerHttpResponse downstream) {
-        downstream.setStatusCode(upstream.statusCode());
-        if (upstream.statusCode().isError()) return upstream.bodyToMono(byte[].class)
-                .flatMap(bytes -> Mono.error(new GatewayException("PROVIDER_" + upstream.statusCode().value(), mapStatus(upstream.statusCode().value()), safeProviderMessage(bytes))));
-        return upstream.bodyToMono(byte[].class);
-    }
-
-    private Mono<Void> stream(JsonNode request, ServerHttpResponse response, Reservation reservation, String providerBaseUrl,
-                              String promptVersion, String releaseId, String variant) {
-        ByteArrayOutputStream capture = new ByteArrayOutputStream(); AtomicBoolean finalized = new AtomicBoolean();
-        AtomicBoolean firstToken = new AtomicBoolean(); AtomicLong started = new AtomicLong(System.nanoTime());
-        AtomicReference<Throwable> streamFailure = new AtomicReference<>();
-        ProviderUsageAccumulator usageAccumulator = new ProviderUsageAccumulator(mapper);
-        AtomicReference<String> providerGenerationId = new AtomicReference<>();
-        if (!providerCircuit.tryAcquirePermission()) {
-            finishAsync(reservation, zeroUsage(), "FAILED", promptVersion);
-            return Mono.error(new GatewayException("PROVIDER_CIRCUIT_OPEN", HttpStatus.SERVICE_UNAVAILABLE, "Provider circuit is open"));
-        }
-        response.setStatusCode(HttpStatus.OK); response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
-        Flux<DataBuffer> body = provider.post().uri(completionUri(providerBaseUrl))
-                .headers(headers -> upstreamHeaders(headers, reservation, promptVersion, releaseId, variant)).bodyValue(request)
-                .exchangeToFlux(upstream -> readStream(upstream))
-                .doOnNext(bytes -> {
-                    if (firstToken.compareAndSet(false, true)) meters.timer("agentops.gateway.first_token").record(Duration.ofNanos(System.nanoTime() - started.get()));
-                    usageAccumulator.accept(bytes);
-                    String observedId = usageAccumulator.generationId();
-                    if (observedId != null && !observedId.equals(providerGenerationId.getAndSet(observedId))) {
-                        persistGenerationIdAsync(reservation, observedId);
-                    }
-                    if (capture.size() + bytes.length <= MAX_CAPTURE_BYTES) capture.writeBytes(bytes);
+            .doOnSubscribe(
+                ignored -> {
+                  activeConnections.incrementAndGet();
+                  meters.counter("agentops.gateway.connections", "event", "opened").increment();
                 })
-                .onBackpressureBuffer(Math.max(8, properties.streamBufferSize()), ignored -> meters.counter("agentops.gateway.buffer_overflow").increment(), reactor.core.publisher.BufferOverflowStrategy.ERROR)
-                .map(bytes -> response.bufferFactory().wrap(bytes))
-                .doOnComplete(() -> providerCircuit.onSuccess(System.nanoTime() - started.get(), java.util.concurrent.TimeUnit.NANOSECONDS))
-                .doOnError(error -> {
-                    streamFailure.set(error);
-                    providerCircuit.onError(System.nanoTime() - started.get(), java.util.concurrent.TimeUnit.NANOSECONDS, error);
-                })
-                .doOnSubscribe(ignored -> { activeConnections.incrementAndGet(); meters.counter("agentops.gateway.connections", "event", "opened").increment(); })
-                .doFinally(signal -> {
-                    if (signal == SignalType.CANCEL) providerCircuit.releasePermission();
-                    activeConnections.updateAndGet(value -> Math.max(0, value - 1)); meters.counter("agentops.gateway.connections", "event", "closed", "signal", signal.name()).increment();
-                    if (finalized.compareAndSet(false, true)) {
-                        boolean interrupted = signal == SignalType.CANCEL || signal == SignalType.ON_ERROR;
-                        ConfirmedUsage confirmed = capture.size() == 0 && isProviderRejection(streamFailure.get())
-                                ? zeroUsage() : usageAccumulator.usage(request);
-                        finishAsync(reservation, confirmed, interrupted ? "CANCELLED" : "SETTLED", promptVersion, providerGenerationId.get());
-                    }
-                    meters.timer("agentops.gateway.duration", "mode", "stream", "signal", signal.name())
-                            .record(Duration.ofNanos(System.nanoTime() - started.get()));
+            .doFinally(
+                signal -> {
+                  if (signal == SignalType.CANCEL) providerCircuit.releasePermission();
+                  activeConnections.updateAndGet(value -> Math.max(0, value - 1));
+                  meters
+                      .counter(
+                          "agentops.gateway.connections",
+                          "event",
+                          "closed",
+                          "signal",
+                          signal.name())
+                      .increment();
+                  if (finalized.compareAndSet(false, true)) {
+                    boolean interrupted =
+                        signal == SignalType.CANCEL || signal == SignalType.ON_ERROR;
+                    ConfirmedUsage confirmed =
+                        capture.size() == 0 && isProviderRejection(streamFailure.get())
+                            ? zeroUsage()
+                            : usageAccumulator.usage(request);
+                    finishAsync(
+                        reservation,
+                        confirmed,
+                        interrupted ? "CANCELLED" : "SETTLED",
+                        metadata.promptVersion(),
+                        providerGenerationId.get());
+                  }
+                  meters
+                      .timer("agentops.gateway.duration", "mode", "stream", "signal", signal.name())
+                      .record(Duration.ofNanos(System.nanoTime() - started.get()));
                 });
-        return markProviderStarted(reservation).then(response.writeWith(body));
-    }
+    return markProviderStarted(reservation).then(response.writeWith(body));
+  }
 
-    private Flux<byte[]> readStream(ClientResponse upstream) {
-        if (upstream.statusCode().isError()) return upstream.bodyToMono(byte[].class)
-                .flatMapMany(bytes -> Flux.error(new GatewayException("PROVIDER_" + upstream.statusCode().value(), mapStatus(upstream.statusCode().value()), safeProviderMessage(bytes))));
-        return upstream.bodyToFlux(byte[].class);
-    }
+  private Flux<byte[]> readStream(ClientResponse upstream) {
+    if (upstream.statusCode().isError())
+      return upstream
+          .bodyToMono(byte[].class)
+          .flatMapMany(
+              bytes ->
+                  Flux.error(
+                      new GatewayException(
+                          "PROVIDER_" + upstream.statusCode().value(),
+                          mapStatus(upstream.statusCode().value()),
+                          safeProviderMessage(bytes))));
+    return upstream.bodyToFlux(byte[].class);
+  }
 
-    private void upstreamHeaders(HttpHeaders headers, Reservation reservation, String promptVersion, String releaseId, String variant) {
-        headers.setBearerAuth(properties.providerApiKey()); headers.set("X-AgentOps-Request-Id", reservation.requestId());
-        put(headers, "Prompt-Version", promptVersion); put(headers, "Release-Id", releaseId); put(headers, "Variant", variant);
-    }
+  private void upstreamHeaders(
+      HttpHeaders headers, Reservation reservation, RequestMetadata metadata) {
+    headers.setBearerAuth(properties.providerApiKey());
+    headers.set("X-AgentOps-Request-Id", reservation.requestId());
+    put(headers, "Prompt-Version", metadata.promptVersion());
+    put(headers, "Release-Id", metadata.releaseId());
+    put(headers, "Variant", metadata.variant());
+  }
 
-    private void finishAsync(Reservation reservation, ConfirmedUsage confirmed, String state, String promptVersion) {
-        submitFinalization(state, () -> usage.finalizeReservation(reservation, confirmed, state, promptVersion));
-    }
+  private void finishAsync(
+      Reservation reservation, ConfirmedUsage confirmed, String state, String promptVersion) {
+    submitFinalization(
+        state, () -> usage.finalizeReservation(reservation, confirmed, state, promptVersion));
+  }
 
-    /** Persists a queryable provider ID outside the response subscription before asynchronous settlement. */
-    private void persistGenerationIdAsync(Reservation reservation, String providerGenerationId) {
-        if (providerGenerationId == null || providerGenerationId.isBlank()) return;
-        finalizer.submit(() -> usage.recordProviderGenerationId(reservation.reservationId(), providerGenerationId));
-    }
+  /**
+   * Persists a queryable provider ID outside the response subscription before asynchronous
+   * settlement.
+   */
+  private void persistGenerationIdAsync(Reservation reservation, String providerGenerationId) {
+    if (providerGenerationId == null || providerGenerationId.isBlank()) return;
+    finalizer.submit(
+        () -> usage.recordProviderGenerationId(reservation.reservationId(), providerGenerationId));
+  }
 
-    /** Keeps JDBC attempt creation off the Netty event loop and before the provider request is subscribed. */
-    private Mono<Void> markProviderStarted(Reservation reservation) {
-        return Mono.fromRunnable(() -> usage.markProviderStarted(reservation.reservationId())).subscribeOn(blockingScheduler).then();
-    }
+  /**
+   * Keeps JDBC attempt creation off the Netty event loop and before the provider request is
+   * subscribed.
+   */
+  private Mono<Void> markProviderStarted(Reservation reservation) {
+    return Mono.fromRunnable(() -> usage.markProviderStarted(reservation.reservationId()))
+        .subscribeOn(blockingScheduler)
+        .then();
+  }
 
-    /** Finalizes after persisting the ID observed on this response, preserving ordering across cancellation. */
-    private void finishAsync(Reservation reservation, ConfirmedUsage confirmed, String state, String promptVersion, String providerGenerationId) {
-        submitFinalization(state, () -> usage.finalizeReservation(reservation, confirmed, state, promptVersion, providerGenerationId));
-    }
+  /**
+   * Finalizes after persisting the ID observed on this response, preserving ordering across
+   * cancellation.
+   */
+  private void finishAsync(
+      Reservation reservation,
+      ConfirmedUsage confirmed,
+      String state,
+      String promptVersion,
+      String providerGenerationId) {
+    submitFinalization(
+        state,
+        () ->
+            usage.finalizeReservation(
+                reservation, confirmed, state, promptVersion, providerGenerationId));
+  }
 
-    /** Measures the cancellation-safe handoff separately from the client response lifecycle. */
-    private void submitFinalization(String state, Runnable action) {
-        long terminalAt = System.nanoTime();
-        activeFinalizations.incrementAndGet();
-        try {
-            finalizer.submit(() -> {
-                meters.timer("agentops.gateway.finalization.queue", "state", state)
-                        .record(Duration.ofNanos(System.nanoTime() - terminalAt));
-                try {
-                    action.run();
-                    meters.counter("agentops.gateway.finalizations", "state", state, "outcome", "success").increment();
-                } catch (RuntimeException failure) {
-                    meters.counter("agentops.gateway.finalizations", "state", state, "outcome", "failure").increment();
-                } finally {
-                    activeFinalizations.updateAndGet(value -> Math.max(0, value - 1));
-                    meters.timer("agentops.gateway.terminal_to_finalized", "state", state)
-                            .record(Duration.ofNanos(System.nanoTime() - terminalAt));
-                }
-            });
-        } catch (RejectedExecutionException rejected) {
-            activeFinalizations.updateAndGet(value -> Math.max(0, value - 1));
-            meters.counter("agentops.gateway.finalizations", "state", state, "outcome", "rejected").increment();
-        }
-    }
-
-    private ConfirmedUsage usageFromJson(byte[] bytes, JsonNode request, boolean partial) {
-        try {
-            JsonNode root = mapper.readTree(bytes); JsonNode usageNode = root.path("usage");
-            if (validUsage(usageNode)) return new ConfirmedUsage(usageNode.path("prompt_tokens").longValue(), usageNode.path("completion_tokens").longValue(), false);
-            String completion = root.path("choices").path(0).path("message").path("content").asText("");
-            ConfirmedUsage fallback = fallbackUsage(request, partial);
-            return new ConfirmedUsage(fallback.inputTokens(), Math.max(0, completion.length() / 4L), true);
-        } catch (Exception ignored) { }
-        return fallbackUsage(request, partial);
-    }
-
-    /** A missing, null, textual, negative, or partial object is not authoritative provider usage. */
-    private static boolean validUsage(JsonNode usageNode) {
-        return usageNode != null && !usageNode.isMissingNode() && !usageNode.isNull()
-                && usageNode.path("prompt_tokens").canConvertToLong() && usageNode.path("completion_tokens").canConvertToLong()
-                && usageNode.path("prompt_tokens").longValue() >= 0 && usageNode.path("completion_tokens").longValue() >= 0;
-    }
-
-    private ConfirmedUsage usageFromSse(byte[] bytes, JsonNode request, boolean partial) {
-        String text = new String(bytes, StandardCharsets.UTF_8);
-        for (String line : text.split("\\R")) {
-            if (!line.startsWith("data:")) continue;
-            String json = line.substring(5).trim();
-            if (json.equals("[DONE]")) continue;
+  /** Measures the cancellation-safe handoff separately from the client response lifecycle. */
+  private void submitFinalization(String state, Runnable action) {
+    long terminalAt = System.nanoTime();
+    activeFinalizations.incrementAndGet();
+    try {
+      finalizer.submit(
+          () -> {
+            meters
+                .timer("agentops.gateway.finalization.queue", "state", state)
+                .record(Duration.ofNanos(System.nanoTime() - terminalAt));
             try {
-                JsonNode node = mapper.readTree(json).path("usage");
-                if (!node.isMissingNode() && !node.isNull()) return new ConfirmedUsage(node.path("prompt_tokens").asLong(), node.path("completion_tokens").asLong(), false);
-            } catch (Exception ignored) { }
-        }
-        long outputEstimate = Math.max(1, text.length() / 4L);
-        ConfirmedUsage base = fallbackUsage(request, partial);
-        return new ConfirmedUsage(base.inputTokens(), Math.min(base.outputTokens(), outputEstimate), true);
+              action.run();
+              meters
+                  .counter("agentops.gateway.finalizations", "state", state, "outcome", "success")
+                  .increment();
+            } catch (RuntimeException failure) {
+              meters
+                  .counter("agentops.gateway.finalizations", "state", state, "outcome", "failure")
+                  .increment();
+            } finally {
+              activeFinalizations.updateAndGet(value -> Math.max(0, value - 1));
+              meters
+                  .timer("agentops.gateway.terminal_to_finalized", "state", state)
+                  .record(Duration.ofNanos(System.nanoTime() - terminalAt));
+            }
+          });
+    } catch (RejectedExecutionException rejected) {
+      activeFinalizations.updateAndGet(value -> Math.max(0, value - 1));
+      meters
+          .counter("agentops.gateway.finalizations", "state", state, "outcome", "rejected")
+          .increment();
     }
+  }
 
-    /** Extracts a stable provider generation ID from a JSON response or a single SSE payload. */
-    private String providerGenerationId(byte[] bytes) {
-        String value = new String(bytes, StandardCharsets.UTF_8);
-        try {
-            JsonNode root = mapper.readTree(value);
-            String id = root.path("id").asText("");
-            return id.isBlank() ? null : id;
-        } catch (Exception ignored) { }
-        for (String line : value.split("\\R")) {
-            if (!line.startsWith("data:")) continue;
-            try {
-                String id = mapper.readTree(line.substring(5).trim()).path("id").asText("");
-                if (!id.isBlank()) return id;
-            } catch (Exception ignored) { }
-        }
-        return null;
+  private ConfirmedUsage usageFromJson(byte[] bytes, JsonNode request, boolean partial) {
+    try {
+      JsonNode root = mapper.readTree(bytes);
+      JsonNode usageNode = root.path("usage");
+      if (validUsage(usageNode))
+        return new ConfirmedUsage(
+            usageNode.path("prompt_tokens").longValue(),
+            usageNode.path("completion_tokens").longValue(),
+            false);
+      String completion = root.path("choices").path(0).path("message").path("content").asText("");
+      ConfirmedUsage fallback = fallbackUsage(request, partial);
+      return new ConfirmedUsage(
+          fallback.inputTokens(), Math.max(0, completion.length() / 4L), true);
+    } catch (Exception ignored) {
     }
+    return fallbackUsage(request, partial);
+  }
 
-    private ConfirmedUsage fallbackUsage(JsonNode request, boolean partial) {
-        long input = Math.max(1, request.path("messages").toString().length() / 3L);
-        // Partial streams cap their estimate using captured output; never collapse a real partial response to one token.
-        long output = Math.max(1, request.path("max_tokens").asLong(properties.defaultMaxTokens()) / 2);
-        return new ConfirmedUsage(input, output, true);
+  /** A missing, null, textual, negative, or partial object is not authoritative provider usage. */
+  private static boolean validUsage(JsonNode usageNode) {
+    return usageNode != null
+        && !usageNode.isMissingNode()
+        && !usageNode.isNull()
+        && usageNode.path("prompt_tokens").canConvertToLong()
+        && usageNode.path("completion_tokens").canConvertToLong()
+        && usageNode.path("prompt_tokens").longValue() >= 0
+        && usageNode.path("completion_tokens").longValue() >= 0;
+  }
+
+  private ConfirmedUsage usageFromSse(byte[] bytes, JsonNode request, boolean partial) {
+    String text = new String(bytes, StandardCharsets.UTF_8);
+    for (String line : text.split("\\R")) {
+      if (!line.startsWith("data:")) continue;
+      String json = line.substring(5).trim();
+      if (json.equals("[DONE]")) continue;
+      try {
+        JsonNode node = mapper.readTree(json).path("usage");
+        if (!node.isMissingNode() && !node.isNull())
+          return new ConfirmedUsage(
+              node.path("prompt_tokens").asLong(), node.path("completion_tokens").asLong(), false);
+      } catch (Exception ignored) {
+      }
     }
+    long outputEstimate = Math.max(1, text.length() / 4L);
+    ConfirmedUsage base = fallbackUsage(request, partial);
+    return new ConfirmedUsage(
+        base.inputTokens(), Math.min(base.outputTokens(), outputEstimate), true);
+  }
 
-    /** Releases the reservation fully when the provider rejected work before producing a response. */
-    private ConfirmedUsage failureUsage(JsonNode request, Throwable error) {
-        return isProviderRejection(error) ? zeroUsage() : fallbackUsage(request, false);
+  /** Extracts a stable provider generation ID from a JSON response or a single SSE payload. */
+  private String providerGenerationId(byte[] bytes) {
+    String value = new String(bytes, StandardCharsets.UTF_8);
+    try {
+      JsonNode root = mapper.readTree(value);
+      String id = root.path("id").asText("");
+      return id.isBlank() ? null : id;
+    } catch (Exception ignored) {
     }
-
-    private static boolean isProviderRejection(Throwable error) {
-        return error instanceof GatewayException gateway && gateway.code().startsWith("PROVIDER_");
+    for (String line : value.split("\\R")) {
+      if (!line.startsWith("data:")) continue;
+      try {
+        String id = mapper.readTree(line.substring(5).trim()).path("id").asText("");
+        if (!id.isBlank()) return id;
+      } catch (Exception ignored) {
+      }
     }
+    return null;
+  }
 
-    private static ConfirmedUsage zeroUsage() { return new ConfirmedUsage(0, 0, false); }
+  private ConfirmedUsage fallbackUsage(JsonNode request, boolean partial) {
+    long input = Math.max(1, request.path("messages").toString().length() / 3L);
+    // Partial streams cap their estimate using captured output; never collapse a real partial
+    // response to one token.
+    long output = Math.max(1, request.path("max_tokens").asLong(properties.defaultMaxTokens()) / 2);
+    return new ConfirmedUsage(input, output, true);
+  }
 
-    private String safeProviderMessage(byte[] bytes) { String value = new String(bytes, StandardCharsets.UTF_8); return value.length() > 300 ? value.substring(0, 300) : value; }
-    private HttpStatus mapStatus(int status) { return status == 429 ? HttpStatus.TOO_MANY_REQUESTS : status >= 500 ? HttpStatus.BAD_GATEWAY : HttpStatus.valueOf(status); }
-    private static String first(String value, String fallback) { return value == null || value.isBlank() ? fallback : value; }
-    private static void put(HttpHeaders headers, String name, String value) { if (value != null && !value.isBlank()) headers.set(name, value); }
-    /** Builds one absolute compatibility endpoint without producing a double slash. */
-    private static String completionUri(String baseUrl) { return (baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl) + "/v1/chat/completions"; }
+  /** Releases the reservation fully when the provider rejected work before producing a response. */
+  private ConfirmedUsage failureUsage(JsonNode request, Throwable error) {
+    return isProviderRejection(error) ? zeroUsage() : fallbackUsage(request, false);
+  }
 
-    /** Couples an admitted reservation with the endpoint selected in the same blocking stage. */
-    private record ProviderCall(Reservation reservation, String baseUrl) { }
+  private static boolean isProviderRejection(Throwable error) {
+    return error instanceof GatewayException gateway && gateway.code().startsWith("PROVIDER_");
+  }
+
+  private static ConfirmedUsage zeroUsage() {
+    return new ConfirmedUsage(0, 0, false);
+  }
+
+  private String safeProviderMessage(byte[] bytes) {
+    String value = new String(bytes, StandardCharsets.UTF_8);
+    return value.length() > 300 ? value.substring(0, 300) : value;
+  }
+
+  private HttpStatus mapStatus(int status) {
+    return status == 429
+        ? HttpStatus.TOO_MANY_REQUESTS
+        : status >= 500 ? HttpStatus.BAD_GATEWAY : HttpStatus.valueOf(status);
+  }
+
+  private static String first(String value, String fallback) {
+    return value == null || value.isBlank() ? fallback : value;
+  }
+
+  private static void put(HttpHeaders headers, String name, String value) {
+    if (value != null && !value.isBlank()) headers.set(name, value);
+  }
+
+  /** Builds one absolute compatibility endpoint without producing a double slash. */
+  private static String completionUri(String baseUrl) {
+    return (baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl)
+        + "/v1/chat/completions";
+  }
+
+  /** Couples an admitted reservation with the endpoint selected in the same blocking stage. */
+  private record ProviderCall(Reservation reservation, String baseUrl) {}
+
+  private record RequestMetadata(
+      String projectId,
+      String requestId,
+      String correlationId,
+      String idempotencyKey,
+      String promptVersion,
+      String releaseId,
+      String variant) {}
 }

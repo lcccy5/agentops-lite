@@ -15,7 +15,6 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -27,127 +26,390 @@ import org.springframework.transaction.support.TransactionTemplate;
 /** Transactional Prompt, evaluation dispatch, release and rollback control plane. */
 @Service
 public final class ControlPlaneService {
-    private final JdbcTemplate jdbc;
-    private final TransactionTemplate transactions;
-    private final ObjectMapper mapper;
+  private final JdbcTemplate jdbc;
+  private final TransactionTemplate transactions;
+  private final ObjectMapper mapper;
 
-    /** Creates the control-plane service. */
-    public ControlPlaneService(JdbcTemplate jdbc, TransactionTemplate transactions, ObjectMapper mapper) {
-        this.jdbc = jdbc; this.transactions = transactions; this.mapper = mapper;
+  /** Creates the control-plane service. */
+  public ControlPlaneService(
+      JdbcTemplate jdbc, TransactionTemplate transactions, ObjectMapper mapper) {
+    this.jdbc = jdbc;
+    this.transactions = transactions;
+    this.mapper = mapper;
+  }
+
+  /** Creates an immutable version and returns its generated identifier. */
+  public Map<String, Object> createPromptVersion(
+      String projectId, String promptKey, CreatePromptVersionRequest request) {
+    String id = UUID.randomUUID().toString();
+    String hash = sha256(request.template());
+    Instant now = Instant.now();
+    jdbc.update(
+        "insert into"
+            + " prompt_version(prompt_version_id,project_id,prompt_key,version,template_text,template_hash,created_at)"
+            + " values(?,?,?,?,?,?,?)",
+        id,
+        projectId,
+        promptKey,
+        request.version(),
+        request.template(),
+        hash,
+        now);
+    return Map.of(
+        "promptVersionId",
+        id,
+        "promptKey",
+        promptKey,
+        "version",
+        request.version(),
+        "templateHash",
+        hash);
+  }
+
+  /** Resolves forced evaluation versions or the latest active stable canary release. */
+  public ResolvedPrompt resolve(
+      String projectId,
+      String promptKey,
+      String environment,
+      String subjectKey,
+      String forcedVersion) {
+    if (forcedVersion != null && !forcedVersion.isBlank()) {
+      return prompt(projectId, promptKey, forcedVersion, null, "forced");
     }
 
-    /** Creates an immutable version and returns its generated identifier. */
-    public Map<String, Object> createPromptVersion(String projectId, String promptKey, CreatePromptVersionRequest request) {
-        String id = UUID.randomUUID().toString(); String hash = sha256(request.template()); Instant now = Instant.now();
-        jdbc.update("insert into prompt_version(prompt_version_id,project_id,prompt_key,version,template_text,template_hash,created_at) values(?,?,?,?,?,?,?)",
-                id, projectId, promptKey, request.version(), request.template(), hash, now);
-        return Map.of("promptVersionId", id, "promptKey", promptKey, "version", request.version(), "templateHash", hash);
+    PromptRelease activeRelease = findActiveRelease(projectId, promptKey, environment);
+    if (activeRelease != null) {
+      return resolveActiveRelease(projectId, promptKey, subjectKey, activeRelease);
     }
 
-    /** Resolves forced evaluation versions or the latest active stable canary release. */
-    public ResolvedPrompt resolve(String projectId, String promptKey, String environment, String subjectKey, String forcedVersion) {
-        if (forcedVersion != null && !forcedVersion.isBlank()) return prompt(projectId, promptKey, forcedVersion, null, "forced");
-        List<Map<String, Object>> releases = jdbc.queryForList("select release_id,stable_version,candidate_version,canary_percent from prompt_release where project_id=? and prompt_key=? and environment_name=? and status='ACTIVE' order by created_at desc limit 1",
-                projectId, promptKey, environment);
-        if (releases.isEmpty()) {
-            // A rollback is a durable routing decision; never fall through to a newer candidate prompt.
-            List<Map<String, Object>> rolledBack = jdbc.queryForList("select release_id,stable_version from prompt_release where project_id=? and prompt_key=? and environment_name=? and status='ROLLED_BACK' order by rolled_back_at desc limit 1",
-                    projectId, promptKey, environment);
-            if (!rolledBack.isEmpty()) {
-                Map<String, Object> release = rolledBack.getFirst();
-                return prompt(projectId, promptKey, release.get("stable_version").toString(), release.get("release_id").toString(), "rollback-stable");
-            }
-            List<String> versions = jdbc.query("select version from prompt_version where project_id=? and prompt_key=? order by created_at desc limit 1", (rs, row) -> rs.getString(1), projectId, promptKey);
-            if (versions.isEmpty()) throw new GatewayException("PROMPT_NOT_FOUND", HttpStatus.NOT_FOUND, "No prompt version exists");
-            return prompt(projectId, promptKey, versions.getFirst(), null, "stable");
-        }
-        Map<String, Object> release = releases.getFirst(); String releaseId = release.get("release_id").toString();
-        int percent = ((Number) release.get("canary_percent")).intValue(); boolean candidate = CanaryBucket.calculate(subjectKey, releaseId) < percent;
-        String version = release.get(candidate ? "candidate_version" : "stable_version").toString();
-        return prompt(projectId, promptKey, version, releaseId, candidate ? "candidate" : "stable");
+    // A rollback is a durable routing decision; never fall through to a newer candidate prompt.
+    PromptRelease rolledBackRelease = findLatestRollback(projectId, promptKey, environment);
+    if (rolledBackRelease != null) {
+      return prompt(
+          projectId,
+          promptKey,
+          rolledBackRelease.stableVersion(),
+          rolledBackRelease.releaseId(),
+          "rollback-stable");
     }
 
-    /** Imports all cases atomically so jobs never observe a partial dataset. */
-    public Map<String, Object> importDataset(String projectId, ImportDatasetRequest request) {
-        String datasetId = UUID.randomUUID().toString(); Instant now = Instant.now();
-        transactions.executeWithoutResult(status -> {
-            jdbc.update("insert into eval_dataset(dataset_id,project_id,name,created_at) values(?,?,?,?)", datasetId, projectId, request.name(), now);
-            for (Contracts.EvalCaseDefinition definition : request.cases()) {
-                jdbc.update("insert into eval_case(case_id,dataset_id,definition_json) values(?,?,?)", definition.caseId(), datasetId, json(definition));
+    return prompt(
+        projectId, promptKey, findLatestPromptVersion(projectId, promptKey), null, "stable");
+  }
+
+  private PromptRelease findActiveRelease(String projectId, String promptKey, String environment) {
+    List<PromptRelease> releases =
+        jdbc.query(
+            """
+            select release_id, stable_version, candidate_version, canary_percent
+            from prompt_release
+            where project_id = ?
+              and prompt_key = ?
+              and environment_name = ?
+              and status = 'ACTIVE'
+            order by created_at desc
+            limit 1
+            """,
+            (resultSet, rowNumber) ->
+                new PromptRelease(
+                    resultSet.getString("release_id"),
+                    resultSet.getString("stable_version"),
+                    resultSet.getString("candidate_version"),
+                    resultSet.getInt("canary_percent")),
+            projectId,
+            promptKey,
+            environment);
+    return releases.isEmpty() ? null : releases.getFirst();
+  }
+
+  private PromptRelease findLatestRollback(String projectId, String promptKey, String environment) {
+    List<PromptRelease> releases =
+        jdbc.query(
+            """
+            select release_id, stable_version
+            from prompt_release
+            where project_id = ?
+              and prompt_key = ?
+              and environment_name = ?
+              and status = 'ROLLED_BACK'
+            order by rolled_back_at desc
+            limit 1
+            """,
+            (resultSet, rowNumber) ->
+                new PromptRelease(
+                    resultSet.getString("release_id"),
+                    resultSet.getString("stable_version"),
+                    null,
+                    0),
+            projectId,
+            promptKey,
+            environment);
+    return releases.isEmpty() ? null : releases.getFirst();
+  }
+
+  private String findLatestPromptVersion(String projectId, String promptKey) {
+    List<String> versions =
+        jdbc.query(
+            """
+            select version
+            from prompt_version
+            where project_id = ? and prompt_key = ?
+            order by created_at desc
+            limit 1
+            """,
+            (resultSet, rowNumber) -> resultSet.getString("version"),
+            projectId,
+            promptKey);
+    if (versions.isEmpty()) {
+      throw new GatewayException(
+          "PROMPT_NOT_FOUND", HttpStatus.NOT_FOUND, "No prompt version exists");
+    }
+    return versions.getFirst();
+  }
+
+  private ResolvedPrompt resolveActiveRelease(
+      String projectId, String promptKey, String subjectKey, PromptRelease release) {
+    boolean useCandidate =
+        CanaryBucket.calculate(subjectKey, release.releaseId()) < release.canaryPercent();
+    String version = useCandidate ? release.candidateVersion() : release.stableVersion();
+    return prompt(
+        projectId, promptKey, version, release.releaseId(), useCandidate ? "candidate" : "stable");
+  }
+
+  /** Imports all cases atomically so jobs never observe a partial dataset. */
+  public Map<String, Object> importDataset(String projectId, ImportDatasetRequest request) {
+    String datasetId = UUID.randomUUID().toString();
+    Instant now = Instant.now();
+    transactions.executeWithoutResult(
+        status -> {
+          jdbc.update(
+              "insert into eval_dataset(dataset_id,project_id,name,created_at) values(?,?,?,?)",
+              datasetId,
+              projectId,
+              request.name(),
+              now);
+          for (Contracts.EvalCaseDefinition definition : request.cases()) {
+            jdbc.update(
+                "insert into eval_case(case_id,dataset_id,definition_json) values(?,?,?)",
+                definition.caseId(),
+                datasetId,
+                json(definition));
+          }
+        });
+    return Map.of("datasetId", datasetId, "caseCount", request.cases().size());
+  }
+
+  /** Creates stable and candidate tasks plus reliable dispatch outbox rows in one transaction. */
+  public Map<String, Object> createEvalJob(String projectId, CreateEvalJobRequest request) {
+    String jobId = UUID.randomUUID().toString();
+    Instant now = Instant.now();
+    Integer promptCount =
+        jdbc.queryForObject(
+            "select count(*) from prompt_version where project_id=? and prompt_key=? and version in"
+                + " (?,?)",
+            Integer.class,
+            projectId,
+            request.promptKey(),
+            request.stableVersion(),
+            request.candidateVersion());
+    if (promptCount == null || promptCount != 2)
+      throw new GatewayException(
+          "PROMPT_VERSION_NOT_FOUND",
+          HttpStatus.BAD_REQUEST,
+          "Stable and candidate versions must both belong to this project and prompt key");
+    List<String> cases =
+        jdbc.query(
+            "select c.case_id from eval_case c join eval_dataset d on d.dataset_id=c.dataset_id"
+                + " where c.dataset_id=? and d.project_id=? order by c.case_id",
+            (rs, row) -> rs.getString(1),
+            request.datasetId(),
+            projectId);
+    if (cases.isEmpty())
+      throw new GatewayException("DATASET_EMPTY", HttpStatus.BAD_REQUEST, "Dataset has no cases");
+    transactions.executeWithoutResult(
+        status -> {
+          jdbc.update(
+              "insert into"
+                  + " eval_job(job_id,project_id,dataset_id,prompt_key,stable_version,candidate_version,max_token_growth_percent,status,created_at)"
+                  + " values(?,?,?,?,?,?,?,'PENDING',?)",
+              jobId,
+              projectId,
+              request.datasetId(),
+              request.promptKey(),
+              request.stableVersion(),
+              request.candidateVersion(),
+              request.maxAverageTokenGrowthPercent(),
+              now);
+          for (String caseId : cases)
+            for (String version : List.of(request.stableVersion(), request.candidateVersion())) {
+              jdbc.update(
+                  "insert into eval_job_case(job_id,case_id,prompt_version,status)"
+                      + " values(?,?,?,'PENDING')",
+                  jobId,
+                  caseId,
+                  version);
+              EvalCaseEvent event = new EvalCaseEvent(jobId, caseId, version);
+              jdbc.update(
+                  "insert into"
+                      + " eval_dispatch_outbox(event_id,job_id,case_id,prompt_version,event_key,payload_json,status,next_attempt_at,created_at)"
+                      + " values(?,?,?,?,?,?,'PENDING',?,?)",
+                  UUID.randomUUID().toString(),
+                  jobId,
+                  caseId,
+                  version,
+                  caseId,
+                  json(event),
+                  now,
+                  now);
             }
         });
-        return Map.of("datasetId", datasetId, "caseCount", request.cases().size());
-    }
+    return Map.of("jobId", jobId, "taskCount", cases.size() * 2, "status", "PENDING");
+  }
 
-    /** Creates stable and candidate tasks plus reliable dispatch outbox rows in one transaction. */
-    public Map<String, Object> createEvalJob(String projectId, CreateEvalJobRequest request) {
-        String jobId = UUID.randomUUID().toString(); Instant now = Instant.now();
-        Integer promptCount = jdbc.queryForObject("select count(*) from prompt_version where project_id=? and prompt_key=? and version in (?,?)",
-                Integer.class, projectId, request.promptKey(), request.stableVersion(), request.candidateVersion());
-        if (promptCount == null || promptCount != 2) throw new GatewayException("PROMPT_VERSION_NOT_FOUND", HttpStatus.BAD_REQUEST, "Stable and candidate versions must both belong to this project and prompt key");
-        List<String> cases = jdbc.query("select c.case_id from eval_case c join eval_dataset d on d.dataset_id=c.dataset_id where c.dataset_id=? and d.project_id=? order by c.case_id",
-                (rs, row) -> rs.getString(1), request.datasetId(), projectId);
-        if (cases.isEmpty()) throw new GatewayException("DATASET_EMPTY", HttpStatus.BAD_REQUEST, "Dataset has no cases");
-        transactions.executeWithoutResult(status -> {
-            jdbc.update("insert into eval_job(job_id,project_id,dataset_id,prompt_key,stable_version,candidate_version,max_token_growth_percent,status,created_at) values(?,?,?,?,?,?,?,'PENDING',?)",
-                    jobId, projectId, request.datasetId(), request.promptKey(), request.stableVersion(), request.candidateVersion(), request.maxAverageTokenGrowthPercent(), now);
-            for (String caseId : cases) for (String version : List.of(request.stableVersion(), request.candidateVersion())) {
-                jdbc.update("insert into eval_job_case(job_id,case_id,prompt_version,status) values(?,?,?,'PENDING')", jobId, caseId, version);
-                EvalCaseEvent event = new EvalCaseEvent(jobId, caseId, version);
-                jdbc.update("insert into eval_dispatch_outbox(event_id,job_id,case_id,prompt_version,event_key,payload_json,status,next_attempt_at,created_at) values(?,?,?,?,?,?,'PENDING',?,?)",
-                        UUID.randomUUID().toString(), jobId, caseId, version, caseId, json(event), now, now);
-            }
+  /** Creates only a 0, 5 or 100 percent release backed by a passing gate. */
+  public Map<String, Object> createRelease(String projectId, CreateReleaseRequest request) {
+    if (!List.of(0, 5, 100).contains(request.canaryPercent()))
+      throw new GatewayException(
+          "INVALID_CANARY_PERCENT", HttpStatus.BAD_REQUEST, "canaryPercent must be 0, 5 or 100");
+    Integer matchingGate =
+        jdbc.queryForObject(
+            "select count(*) from eval_gate_result g join eval_job j on j.job_id=g.job_id where"
+                + " g.gate_result_id=? and g.passed=true and j.project_id=? and j.prompt_key=? and"
+                + " j.stable_version=? and j.candidate_version=?",
+            Integer.class,
+            request.gateResultId(),
+            projectId,
+            request.promptKey(),
+            request.stableVersion(),
+            request.candidateVersion());
+    if (matchingGate == null || matchingGate != 1)
+      throw new GatewayException(
+          "EVAL_GATE_REJECTED",
+          HttpStatus.CONFLICT,
+          "Passing gate must match this project, prompt key and exact versions");
+    String id = UUID.randomUUID().toString();
+    Instant now = Instant.now();
+    transactions.executeWithoutResult(
+        status -> {
+          jdbc.update(
+              "update prompt_release set status='SUPERSEDED' where project_id=? and prompt_key=?"
+                  + " and environment_name=? and status='ACTIVE'",
+              projectId,
+              request.promptKey(),
+              request.environment());
+          jdbc.update(
+              "insert into"
+                  + " prompt_release(release_id,project_id,prompt_key,environment_name,stable_version,candidate_version,canary_percent,gate_result_id,status,created_at)"
+                  + " values(?,?,?,?,?,?,?,?, 'ACTIVE',?)",
+              id,
+              projectId,
+              request.promptKey(),
+              request.environment(),
+              request.stableVersion(),
+              request.candidateVersion(),
+              request.canaryPercent(),
+              request.gateResultId(),
+              now);
         });
-        return Map.of("jobId", jobId, "taskCount", cases.size() * 2, "status", "PENDING");
-    }
+    return release(projectId, id);
+  }
 
-    /** Creates only a 0, 5 or 100 percent release backed by a passing gate. */
-    public Map<String, Object> createRelease(String projectId, CreateReleaseRequest request) {
-        if (!List.of(0, 5, 100).contains(request.canaryPercent())) throw new GatewayException("INVALID_CANARY_PERCENT", HttpStatus.BAD_REQUEST, "canaryPercent must be 0, 5 or 100");
-        Integer matchingGate = jdbc.queryForObject("select count(*) from eval_gate_result g join eval_job j on j.job_id=g.job_id where g.gate_result_id=? and g.passed=true and j.project_id=? and j.prompt_key=? and j.stable_version=? and j.candidate_version=?",
-                Integer.class, request.gateResultId(), projectId, request.promptKey(), request.stableVersion(), request.candidateVersion());
-        if (matchingGate == null || matchingGate != 1) throw new GatewayException("EVAL_GATE_REJECTED", HttpStatus.CONFLICT, "Passing gate must match this project, prompt key and exact versions");
-        String id = UUID.randomUUID().toString(); Instant now = Instant.now();
-        transactions.executeWithoutResult(status -> {
-            jdbc.update("update prompt_release set status='SUPERSEDED' where project_id=? and prompt_key=? and environment_name=? and status='ACTIVE'", projectId, request.promptKey(), request.environment());
-            jdbc.update("insert into prompt_release(release_id,project_id,prompt_key,environment_name,stable_version,candidate_version,canary_percent,gate_result_id,status,created_at) values(?,?,?,?,?,?,?,?, 'ACTIVE',?)",
-                    id, projectId, request.promptKey(), request.environment(), request.stableVersion(), request.candidateVersion(), request.canaryPercent(), request.gateResultId(), now);
-        });
-        return release(projectId, id);
-    }
+  /**
+   * Marks a project-owned active release rolled back; uncached resolutions immediately select
+   * stable.
+   */
+  public Map<String, Object> rollback(String projectId, String releaseId) {
+    // The project predicate turns an unknown or foreign release into the same safe failure path.
+    int changed =
+        jdbc.update(
+            "update prompt_release set status='ROLLED_BACK',canary_percent=0,rolled_back_at=? where"
+                + " release_id=? and project_id=? and status='ACTIVE'",
+            Instant.now(),
+            releaseId,
+            projectId);
+    if (changed != 1)
+      throw new GatewayException(
+          "RELEASE_NOT_ACTIVE", HttpStatus.CONFLICT, "Release is not active");
+    return release(projectId, releaseId);
+  }
 
-    /** Marks a project-owned active release rolled back; uncached resolutions immediately select stable. */
-    public Map<String, Object> rollback(String projectId, String releaseId) {
-        // The project predicate turns an unknown or foreign release into the same safe failure path.
-        int changed = jdbc.update("update prompt_release set status='ROLLED_BACK',canary_percent=0,rolled_back_at=? where release_id=? and project_id=? and status='ACTIVE'", Instant.now(), releaseId, projectId);
-        if (changed != 1) throw new GatewayException("RELEASE_NOT_ACTIVE", HttpStatus.CONFLICT, "Release is not active");
-        return release(projectId, releaseId);
-    }
+  /** Returns a release diagnostic view only when it belongs to the requested project. */
+  public Map<String, Object> release(String projectId, String releaseId) {
+    return jdbc.queryForMap(
+        "select"
+            + " release_id,prompt_key,environment_name,stable_version,candidate_version,canary_percent,gate_result_id,status,created_at,rolled_back_at"
+            + " from prompt_release where release_id=? and project_id=?",
+        releaseId,
+        projectId);
+  }
 
-    /** Returns a release diagnostic view only when it belongs to the requested project. */
-    public Map<String, Object> release(String projectId, String releaseId) {
-        return jdbc.queryForMap("select release_id,prompt_key,environment_name,stable_version,candidate_version,canary_percent,gate_result_id,status,created_at,rolled_back_at from prompt_release where release_id=? and project_id=?", releaseId, projectId);
-    }
+  /** Returns project-owned job status and its derived completion counts. */
+  public Map<String, Object> job(String projectId, String jobId) {
+    Map<String, Object> row =
+        jdbc.queryForMap(
+            "select"
+                + " job_id,dataset_id,prompt_key,stable_version,candidate_version,status,created_at,completed_at"
+                + " from eval_job where job_id=? and project_id=?",
+            jobId,
+            projectId);
+    row.put(
+        "tasks",
+        jdbc.queryForList(
+            "select status,count(*) count from eval_job_case where job_id=? group by status",
+            jobId));
+    List<Map<String, Object>> gate =
+        jdbc.queryForList(
+            "select gate_result_id,passed,reasons_json,created_at from eval_gate_result where"
+                + " job_id=?",
+            jobId);
+    row.put("gate", gate.isEmpty() ? null : gate.getFirst());
+    return row;
+  }
 
-    /** Returns project-owned job status and its derived completion counts. */
-    public Map<String, Object> job(String projectId, String jobId) {
-        Map<String, Object> row = jdbc.queryForMap("select job_id,dataset_id,prompt_key,stable_version,candidate_version,status,created_at,completed_at from eval_job where job_id=? and project_id=?", jobId, projectId);
-        row.put("tasks", jdbc.queryForList("select status,count(*) count from eval_job_case where job_id=? group by status", jobId));
-        List<Map<String, Object>> gate = jdbc.queryForList("select gate_result_id,passed,reasons_json,created_at from eval_gate_result where job_id=?", jobId);
-        row.put("gate", gate.isEmpty() ? null : gate.getFirst());
-        return row;
-    }
+  /** Returns observations only after proving the job belongs to the calling project. */
+  public List<Map<String, Object>> results(String projectId, String jobId) {
+    // Join through the owning job so a guessed job id cannot expose another Agent's evaluation
+    // data.
+    return jdbc.queryForList(
+        "select"
+            + " r.result_id,r.case_id,r.prompt_version,r.passed,r.hard_safety,r.score_json,r.observation_json,r.input_tokens,r.output_tokens,r.first_token_millis,r.total_millis,r.created_at"
+            + " from eval_result r join eval_job j on j.job_id=r.job_id where r.job_id=? and"
+            + " j.project_id=? order by r.case_id,r.prompt_version",
+        jobId,
+        projectId);
+  }
 
-    /** Returns observations only after proving the job belongs to the calling project. */
-    public List<Map<String, Object>> results(String projectId, String jobId) {
-        // Join through the owning job so a guessed job id cannot expose another Agent's evaluation data.
-        return jdbc.queryForList("select r.result_id,r.case_id,r.prompt_version,r.passed,r.hard_safety,r.score_json,r.observation_json,r.input_tokens,r.output_tokens,r.first_token_millis,r.total_millis,r.created_at from eval_result r join eval_job j on j.job_id=r.job_id where r.job_id=? and j.project_id=? order by r.case_id,r.prompt_version", jobId, projectId);
-    }
+  private ResolvedPrompt prompt(
+      String projectId, String promptKey, String version, String releaseId, String variant) {
+    return jdbc.queryForObject(
+        "select version,template_text,template_hash from prompt_version where project_id=? and"
+            + " prompt_key=? and version=?",
+        (rs, row) ->
+            new ResolvedPrompt(
+                rs.getString(1), releaseId, variant, rs.getString(2), rs.getString(3)),
+        projectId,
+        promptKey,
+        version);
+  }
 
-    private ResolvedPrompt prompt(String projectId, String promptKey, String version, String releaseId, String variant) {
-        return jdbc.queryForObject("select version,template_text,template_hash from prompt_version where project_id=? and prompt_key=? and version=?",
-                (rs, row) -> new ResolvedPrompt(rs.getString(1), releaseId, variant, rs.getString(2), rs.getString(3)), projectId, promptKey, version);
+  private String json(Object value) {
+    try {
+      return mapper.writeValueAsString(value);
+    } catch (JsonProcessingException exception) {
+      throw new IllegalStateException(exception);
     }
-    private String json(Object value) { try { return mapper.writeValueAsString(value); } catch (JsonProcessingException exception) { throw new IllegalStateException(exception); } }
-    private static String sha256(String value) { try { return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))); } catch (NoSuchAlgorithmException exception) { throw new IllegalStateException(exception); } }
+  }
+
+  private static String sha256(String value) {
+    try {
+      return java.util.HexFormat.of()
+          .formatHex(
+              MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+    } catch (NoSuchAlgorithmException exception) {
+      throw new IllegalStateException(exception);
+    }
+  }
+
+  private record PromptRelease(
+      String releaseId, String stableVersion, String candidateVersion, int canaryPercent) {}
 }

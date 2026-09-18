@@ -22,56 +22,86 @@ import org.springframework.web.server.ServerWebExchange;
 @RestController
 @RequestMapping("/internal/v1")
 public final class ControlPlaneController {
-    private final ControlPlaneService service;
+  private final ControlPlaneService service;
 
-    /** Creates the management API. */
-    public ControlPlaneController(ControlPlaneService service) { this.service = service; }
+  /** Creates the management API. */
+  public ControlPlaneController(ControlPlaneService service) {
+    this.service = service;
+  }
 
-    /** Creates an immutable prompt version. */
-    @PostMapping("/prompts/createVersion/{promptKey}")
-    public Map<String, Object> createPromptVersion(@PathVariable String promptKey, @Valid @RequestBody CreatePromptVersionRequest request, ServerWebExchange exchange) {
-        return service.createPromptVersion(project(exchange), promptKey, request);
-    }
+  /** Creates an immutable prompt version. */
+  @PostMapping("/prompts/createVersion/{promptKey}")
+  public Map<String, Object> createPromptVersion(
+      @PathVariable String promptKey,
+      @Valid @RequestBody CreatePromptVersionRequest request,
+      ServerWebExchange exchange) {
+    return service.createPromptVersion(project(exchange), promptKey, request);
+  }
 
-    /** Resolves a stable or candidate prompt for one subject. */
-    @PostMapping("/prompts/resolvePrompt/{promptKey}")
-    public ResolvedPrompt resolvePrompt(@PathVariable String promptKey, @Valid @RequestBody ResolvePromptRequest request, ServerWebExchange exchange) {
-        return service.resolve(project(exchange), promptKey, request.environment(), request.subjectKey(), request.forcedVersion());
-    }
+  /** Resolves a stable or candidate prompt for one subject. */
+  @PostMapping("/prompts/resolvePrompt/{promptKey}")
+  public ResolvedPrompt resolvePrompt(
+      @PathVariable String promptKey,
+      @Valid @RequestBody ResolvePromptRequest request,
+      ServerWebExchange exchange) {
+    return service.resolve(
+        project(exchange),
+        promptKey,
+        request.environment(),
+        request.subjectKey(),
+        request.forcedVersion());
+  }
 
-    /** Imports an atomic deterministic dataset. */
-    @PostMapping("/evaluations/importDataset")
-    public Map<String, Object> importDataset(@Valid @RequestBody ImportDatasetRequest request, ServerWebExchange exchange) {
-        return service.importDataset(project(exchange), request);
-    }
+  /** Imports an atomic deterministic dataset. */
+  @PostMapping("/evaluations/importDataset")
+  public Map<String, Object> importDataset(
+      @Valid @RequestBody ImportDatasetRequest request, ServerWebExchange exchange) {
+    return service.importDataset(project(exchange), request);
+  }
 
-    /** Creates two evaluation tasks per case through an outbox. */
-    @PostMapping("/evaluations/createJob")
-    public Map<String, Object> createEvaluationJob(@Valid @RequestBody CreateEvalJobRequest request, ServerWebExchange exchange) {
-        return service.createEvalJob(project(exchange), request);
-    }
+  /** Creates two evaluation tasks per case through an outbox. */
+  @PostMapping("/evaluations/createJob")
+  public Map<String, Object> createEvaluationJob(
+      @Valid @RequestBody CreateEvalJobRequest request, ServerWebExchange exchange) {
+    return service.createEvalJob(project(exchange), request);
+  }
 
-    /** Queries aggregate job progress. */
-    @GetMapping("/evaluations/queryJob/{jobId}")
-    public Map<String, Object> queryEvaluationJob(@PathVariable String jobId, ServerWebExchange exchange) { return service.job(project(exchange), jobId); }
+  /** Queries aggregate job progress. */
+  @GetMapping("/evaluations/queryJob/{jobId}")
+  public Map<String, Object> queryEvaluationJob(
+      @PathVariable String jobId, ServerWebExchange exchange) {
+    return service.job(project(exchange), jobId);
+  }
 
-    /** Queries deterministic case-level observations. */
-    @GetMapping("/evaluations/queryResults/{jobId}")
-    public List<Map<String, Object>> queryEvaluationResults(@PathVariable String jobId, ServerWebExchange exchange) { return service.results(project(exchange), jobId); }
+  /** Queries deterministic case-level observations. */
+  @GetMapping("/evaluations/queryResults/{jobId}")
+  public List<Map<String, Object>> queryEvaluationResults(
+      @PathVariable String jobId, ServerWebExchange exchange) {
+    return service.results(project(exchange), jobId);
+  }
 
-    /** Creates a release only after its referenced gate passed. */
-    @PostMapping("/releases/createRelease")
-    public Map<String, Object> createRelease(@Valid @RequestBody CreateReleaseRequest request, ServerWebExchange exchange) {
-        return service.createRelease(project(exchange), request);
-    }
+  /** Creates a release only after its referenced gate passed. */
+  @PostMapping("/releases/createRelease")
+  public Map<String, Object> createRelease(
+      @Valid @RequestBody CreateReleaseRequest request, ServerWebExchange exchange) {
+    return service.createRelease(project(exchange), request);
+  }
 
-    /** Immediately changes an active release to rolled back. */
-    @PostMapping("/releases/rollbackRelease/{releaseId}")
-    public Map<String, Object> rollbackRelease(@PathVariable String releaseId, ServerWebExchange exchange) { return service.rollback(project(exchange), releaseId); }
+  /** Immediately changes an active release to rolled back. */
+  @PostMapping("/releases/rollbackRelease/{releaseId}")
+  public Map<String, Object> rollbackRelease(
+      @PathVariable String releaseId, ServerWebExchange exchange) {
+    return service.rollback(project(exchange), releaseId);
+  }
 
-    /** Queries one release and its current state. */
-    @GetMapping("/releases/queryRelease/{releaseId}")
-    public Map<String, Object> queryRelease(@PathVariable String releaseId, ServerWebExchange exchange) { return service.release(project(exchange), releaseId); }
+  /** Queries one release and its current state. */
+  @GetMapping("/releases/queryRelease/{releaseId}")
+  public Map<String, Object> queryRelease(
+      @PathVariable String releaseId, ServerWebExchange exchange) {
+    return service.release(project(exchange), releaseId);
+  }
 
-    private String project(ServerWebExchange exchange) { return exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE); }
+  private String project(ServerWebExchange exchange) {
+    return exchange.getAttribute(ApiKeyAuthenticationFilter.PROJECT_ATTRIBUTE);
+  }
 }

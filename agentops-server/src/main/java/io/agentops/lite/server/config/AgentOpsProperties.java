@@ -5,9 +5,16 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Runtime limits and local credentials for the V0.1 deployment. */
 @ConfigurationProperties(prefix = "agentops")
-public record AgentOpsProperties(String adminToken, String providerBaseUrl,
-                                 String providerApiKey, int defaultMaxTokens, int projectMaxTokens,
-                                 int safetyMarginTokens, Duration reservationTimeout,
-                                 int streamBufferSize, String providerSettlementMode,
-                                 String providerUsageQueryPath, Duration usageQueryDeadline,
-                                 int usageQueryRetryLimit) { }
+public record AgentOpsProperties(
+    String adminToken,
+    String providerBaseUrl,
+    String providerApiKey,
+    int defaultMaxTokens,
+    int projectMaxTokens,
+    int safetyMarginTokens,
+    Duration reservationTimeout,
+    int streamBufferSize,
+    String providerSettlementMode,
+    String providerUsageQueryPath,
+    Duration usageQueryDeadline,
+    int usageQueryRetryLimit) {}

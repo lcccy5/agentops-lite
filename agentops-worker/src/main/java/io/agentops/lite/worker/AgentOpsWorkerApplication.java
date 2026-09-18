@@ -8,6 +8,8 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @SpringBootApplication(scanBasePackages = "io.agentops.lite")
 @EnableScheduling
 public class AgentOpsWorkerApplication {
-    /** Starts AgentOps Worker. */
-    public static void main(String[] args) { SpringApplication.run(AgentOpsWorkerApplication.class, args); }
+  /** Starts AgentOps Worker. */
+  public static void main(String[] args) {
+    SpringApplication.run(AgentOpsWorkerApplication.class, args);
+  }
 }

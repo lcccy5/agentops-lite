@@ -13,18 +13,22 @@ import reactor.core.scheduler.Schedulers;
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties(AgentOpsProperties.class)
 public class RuntimeConfiguration {
-    /** Creates the provider client with a configured upstream origin. */
-    @Bean WebClient providerWebClient(WebClient.Builder builder, AgentOpsProperties properties) {
-        return builder.baseUrl(properties.providerBaseUrl()).build();
-    }
+  /** Creates the provider client with a configured upstream origin. */
+  @Bean
+  WebClient providerWebClient(WebClient.Builder builder, AgentOpsProperties properties) {
+    return builder.baseUrl(properties.providerBaseUrl()).build();
+  }
 
-    /** Runs JDBC and Redis admission operations on virtual threads with a concurrency cap. */
-    @Bean(destroyMethod = "close") ExecutorService blockingExecutor() {
-        return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("agentops-blocking-", 0).factory());
-    }
+  /** Runs JDBC and Redis admission operations on virtual threads with a concurrency cap. */
+  @Bean(destroyMethod = "close")
+  ExecutorService blockingExecutor() {
+    return Executors.newThreadPerTaskExecutor(
+        Thread.ofVirtual().name("agentops-blocking-", 0).factory());
+  }
 
-    /** Adapts the virtual-thread executor for Reactor boundaries. */
-    @Bean(destroyMethod = "dispose") Scheduler blockingScheduler(ExecutorService blockingExecutor) {
-        return Schedulers.fromExecutorService(blockingExecutor);
-    }
+  /** Adapts the virtual-thread executor for Reactor boundaries. */
+  @Bean(destroyMethod = "dispose")
+  Scheduler blockingScheduler(ExecutorService blockingExecutor) {
+    return Schedulers.fromExecutorService(blockingExecutor);
+  }
 }

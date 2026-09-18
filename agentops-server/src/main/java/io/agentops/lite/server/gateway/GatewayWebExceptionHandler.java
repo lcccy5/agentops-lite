@@ -16,18 +16,32 @@ import reactor.core.publisher.Mono;
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE)
 public final class GatewayWebExceptionHandler implements WebExceptionHandler {
-    private final ObjectMapper mapper;
+  private final ObjectMapper mapper;
 
-    /** Creates the filter-chain error writer. */
-    public GatewayWebExceptionHandler(ObjectMapper mapper) { this.mapper = mapper; }
+  /** Creates the filter-chain error writer. */
+  public GatewayWebExceptionHandler(ObjectMapper mapper) {
+    this.mapper = mapper;
+  }
 
-    /** Writes expected gateway errors and delegates every unrelated exception. */
-    @Override public Mono<Void> handle(ServerWebExchange exchange, Throwable exception) {
-        if (!(exception instanceof GatewayException gateway)) return Mono.error(exception);
-        try {
-            byte[] body = mapper.writeValueAsBytes(new ApiError(gateway.code(), gateway.getMessage(), UUID.randomUUID().toString(), Instant.now()));
-            exchange.getResponse().setStatusCode(gateway.status()); exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
-            return exchange.getResponse().writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(body)));
-        } catch (Exception serializationFailure) { return Mono.error(serializationFailure); }
+  /** Writes expected gateway errors and delegates every unrelated exception. */
+  @Override
+  public Mono<Void> handle(ServerWebExchange exchange, Throwable exception) {
+    if (!(exception instanceof GatewayException gateway)) return Mono.error(exception);
+    try {
+      byte[] body =
+          mapper.writeValueAsBytes(
+              new ApiError(
+                  gateway.code(),
+                  gateway.getMessage(),
+                  UUID.randomUUID().toString(),
+                  Instant.now()));
+      exchange.getResponse().setStatusCode(gateway.status());
+      exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+      return exchange
+          .getResponse()
+          .writeWith(Mono.just(exchange.getResponse().bufferFactory().wrap(body)));
+    } catch (Exception serializationFailure) {
+      return Mono.error(serializationFailure);
     }
+  }
 }
